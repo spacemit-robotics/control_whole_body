@@ -1,0 +1,13 @@
+whole_body:
+  cycle_s: 0.001
+  startup_feedback_timeout_s: 1.0
+  feedback_timeout_s: 0.04
+  command_timeout_s: 0.1
+  startup_mode: read_only
+  allow_actuation: false
+  unsupported_field: true
+  buses: []
+  motors: []
+  joints: []
+  couplings: []
+  imu: {}

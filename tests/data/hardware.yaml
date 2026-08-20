@@ -1,0 +1,57 @@
+whole_body:
+  cycle_s: 0.001
+  startup_feedback_timeout_s: 1.0
+  feedback_timeout_s: 0.04
+  command_timeout_s: 0.1
+  startup_mode: disabled
+  allow_actuation: true
+  buses:
+    - {name: leg_bus, type: socketcan, device: can0, bitrate: 1000000}
+  motors:
+    - name: motor_0
+      driver: drv_can_encos
+      bus: leg_bus
+      model: Encos EC-A10020-P2-24
+      command_id: 1
+      feedback_id: 1
+      polarity: 1
+      zero_offset: 0.0
+      driver_options: &encos_options
+        enable_on_init: false
+        protocol_limits:
+          position: [-12.5, 12.5]
+          velocity: [-18.0, 18.0]
+          torque: [-90.0, 90.0]
+          kp: [0.0, 500.0]
+          kd: [0.0, 5.0]
+    - name: motor_1
+      driver: drv_can_encos
+      bus: leg_bus
+      model: Encos EC-A8116-P1-18
+      command_id: 2
+      feedback_id: 2
+      polarity: -1
+      zero_offset: 0.1
+      driver_options: *encos_options
+  joints:
+    - name: joint_0
+      mapping: direct
+      motors: [motor_0]
+      position_limit: [-1.0, 1.0]
+      velocity_limit: 2.0
+      torque_limit: 3.0
+      impedance: {mode: split, motor_kp_max: 500.0, motor_kd_max: 5.0}
+    - name: joint_1
+      mapping: direct
+      motors: [motor_1]
+      position_limit: [-1.5, 1.5]
+      velocity_limit: 2.5
+      torque_limit: 4.0
+  couplings: []
+  imu:
+    driver: drv_uart_forsense
+    device: /dev/null
+    baud: 460800
+    mounting_matrix: [1, 0, 0, 0, 1, 0, 0, 0, 1]
+    acceleration_bias: [0, 0, 0]
+    gyro_bias: [0, 0, 0]

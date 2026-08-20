@@ -1,0 +1,7 @@
+robot_base:
+  name: test_robot
+  num_dof: 2
+  joint_names: [joint_0, joint_1]
+
+whole_body:
+  config_file: hardware.yaml
