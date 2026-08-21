@@ -1,0 +1,13 @@
+<?xml version="1.0"?>
+<package format="3">
+  <name>whole_body</name>
+  <maintainer email="robot_team@spacemit.com">robot_team</maintainer>
+  <version>0.1.0</version>
+  <description>Robot-model-independent whole-body motor and IMU hardware backend</description>
+  <depend>motor</depend>
+  <depend>imu</depend>
+  <system_depend check="pkg-config --exists yaml-cpp">libyaml-cpp-dev</system_depend>
+  <export>
+    <build_type>cmake</build_type>
+  </export>
+</package>

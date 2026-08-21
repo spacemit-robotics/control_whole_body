@@ -1,0 +1,18 @@
+## Copyright (C) 2026 SpacemiT (Hangzhou) Technology Co. Ltd.
+## SPDX-License-Identifier: Apache-2.0
+
+module: components/control/whole_body
+
+tests:
+  - name: whole-body-offline-contract
+    description: >-
+      Builds and runs config, direct and parallel-ankle mapping, read-only
+      gating and watchdog tests without opening motor or IMU devices.
+    category: functional
+    scopes: [pr]
+    timeout_s: 900
+    workdir: sdk
+    artifacts:
+      - output/test/pr/components__control__whole_body/modules/components__control__whole_body/logs/whole_body_offline_contract.log
+    command: |
+      bash components/control/whole_body/tests/test_offline_contract.sh
