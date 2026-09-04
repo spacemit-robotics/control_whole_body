@@ -9,6 +9,7 @@
 #include "whole_body_core.h"
 
 #include <algorithm>
+#include <chrono>
 #include <cmath>
 #include <cstdio>
 #include <cstring>
@@ -21,6 +22,11 @@ namespace whole_body {
 namespace {
 
 constexpr double kPositionLimitTolerance = 1.0e-3;
+
+double MonotonicTime() {
+    return std::chrono::duration<double>(
+        std::chrono::steady_clock::now().time_since_epoch()).count();
+}
 
 bool IsValidMode(whole_body_mode mode) {
     return mode >= WHOLE_BODY_MODE_POWER_OFF && mode <= WHOLE_BODY_MODE_HOME;
@@ -145,6 +151,7 @@ WholeBodyCore::WholeBodyCore(RuntimeConfig config, std::unique_ptr<DeviceManager
         }
     }
     motor_states_.resize(config_.motors.size());
+    last_motor_commands_.resize(config_.motors.size());
     joint_position_.resize(config_.joints.size());
     joint_velocity_.resize(config_.joints.size());
     health_.state = WHOLE_BODY_HEALTH_CREATED;
@@ -571,7 +578,7 @@ int WholeBodyCore::Write(const whole_body_joint_command &command, double monoton
     const int build_result = BuildMotorCommands(command, &motor_commands);
     if (build_result != WHOLE_BODY_OK)
         return EnterSafety(build_result, "failed to map joint command to motor space");
-    if (devices_->Write(motor_commands) < 0)
+    if (SendMotorCommands(motor_commands, monotonic_time_s) != WHOLE_BODY_OK)
         return EnterSafety(WHOLE_BODY_ERR_DEVICE, "failed to write motor commands");
     mode_ = command.mode;
     const bool idle_request = !command.enable || command.mode == WHOLE_BODY_MODE_POWER_OFF;
@@ -601,10 +608,19 @@ int WholeBodyCore::Write(const whole_body_joint_command &command, double monoton
     return WHOLE_BODY_OK;
 }
 
+int WholeBodyCore::SendMotorCommands(
+    const std::vector<motor_cmd> &commands, double monotonic_time_s) {
+    if (devices_->Write(commands) < 0) return WHOLE_BODY_ERR_DEVICE;
+    last_motor_commands_ = commands;
+    last_motor_command_time_s_ = monotonic_time_s;
+    has_motor_command_ = true;
+    return WHOLE_BODY_OK;
+}
+
 int WholeBodyCore::SendIdle() {
     std::vector<motor_cmd> commands(config_.motors.size());
     for (auto &command : commands) command.mode = MOTOR_MODE_IDLE;
-    return devices_->Write(commands) < 0 ? WHOLE_BODY_ERR_DEVICE : WHOLE_BODY_OK;
+    return SendMotorCommands(commands, MonotonicTime());
 }
 
 int WholeBodyCore::EnterSafety(int error, const std::string &message) {
@@ -740,16 +756,17 @@ std::string WholeBodyCore::DescribeMotorErrors() const {
 
 whole_body_health WholeBodyCore::GetHealth() const { return health_; }
 
-whole_body_diagnostics WholeBodyCore::GetDiagnostics() const {
-    whole_body_diagnostics diagnostics{};
-    diagnostics.timestamp_s = last_state_.timestamp_s;
-    diagnostics.motor_count = static_cast<uint32_t>(config_.motors.size());
-    diagnostics.joint_count = static_cast<uint32_t>(config_.joints.size());
-    diagnostics.health = health_;
+void WholeBodyCore::GetDiagnostics(whole_body_diagnostics *diagnostics) const {
+    if (!diagnostics) return;
+    *diagnostics = {};
+    diagnostics->timestamp_s = last_state_.timestamp_s;
+    diagnostics->motor_count = static_cast<uint32_t>(config_.motors.size());
+    diagnostics->joint_count = static_cast<uint32_t>(config_.joints.size());
+    diagnostics->health = health_;
 
     for (size_t i = 0; i < config_.motors.size(); ++i) {
         const auto &config = config_.motors[i];
-        auto &output = diagnostics.motors[i];
+        auto &output = diagnostics->motors[i];
         CopyText(config.name, output.name, sizeof(output.name));
         CopyText(config.driver, output.driver, sizeof(output.driver));
         CopyText(config.model, output.model, sizeof(output.model));
@@ -792,7 +809,7 @@ whole_body_diagnostics WholeBodyCore::GetDiagnostics() const {
     }
 
     for (size_t i = 0; i < config_.joints.size(); ++i) {
-        auto &output = diagnostics.joints[i];
+        auto &output = diagnostics->joints[i];
         CopyText(config_.joints[i].name, output.name, sizeof(output.name));
         output.feedback_valid = has_joint_state_;
         if (!has_joint_state_) continue;
@@ -803,19 +820,41 @@ whole_body_diagnostics WholeBodyCore::GetDiagnostics() const {
         output.motor_error = last_state_.motor_error[i];
     }
 
-    CopyText(config_.imu.driver, diagnostics.imu.driver, sizeof(diagnostics.imu.driver));
-    CopyText(config_.imu.device, diagnostics.imu.device, sizeof(diagnostics.imu.device));
-    diagnostics.imu.feedback_received = feedback_status_.imu_received;
-    diagnostics.imu.feedback_fresh = feedback_status_.imu_fresh;
-    diagnostics.imu.feedback_age_s = feedback_status_.imu_age_s;
+    CopyText(config_.imu.driver, diagnostics->imu.driver, sizeof(diagnostics->imu.driver));
+    CopyText(config_.imu.device, diagnostics->imu.device, sizeof(diagnostics->imu.device));
+    diagnostics->imu.feedback_received = feedback_status_.imu_received;
+    diagnostics->imu.feedback_fresh = feedback_status_.imu_fresh;
+    diagnostics->imu.feedback_age_s = feedback_status_.imu_age_s;
     if (feedback_status_.imu_received) {
-        for (size_t i = 0; i < 4; ++i) diagnostics.imu.quaternion[i] = imu_state_.quat[i];
+        for (size_t i = 0; i < 4; ++i) diagnostics->imu.quaternion[i] = imu_state_.quat[i];
         for (size_t i = 0; i < 3; ++i) {
-            diagnostics.imu.gyro[i] = imu_state_.gyro[i];
-            diagnostics.imu.acceleration[i] = imu_state_.acc[i];
+            diagnostics->imu.gyro[i] = imu_state_.gyro[i];
+            diagnostics->imu.acceleration[i] = imu_state_.acc[i];
         }
     }
-    return diagnostics;
+}
+
+void WholeBodyCore::GetMotorCommandDiagnostics(
+    whole_body_motor_command_diagnostics *diagnostics) const {
+    if (!diagnostics) return;
+    *diagnostics = {};
+    diagnostics->motor_count = static_cast<uint32_t>(config_.motors.size());
+    if (!has_motor_command_) return;
+
+    const double command_age_s =
+        std::max(0.0, MonotonicTime() - last_motor_command_time_s_);
+    for (size_t i = 0; i < last_motor_commands_.size(); ++i) {
+        const auto &command = last_motor_commands_[i];
+        auto &output = diagnostics->motors[i];
+        output.valid = true;
+        output.age_s = command_age_s;
+        output.mode = command.mode;
+        output.position = command.pos_des;
+        output.velocity = command.vel_des;
+        output.torque = command.trq_des;
+        output.kp = command.kp;
+        output.kd = command.kd;
+    }
 }
 
 double WholeBodyCore::CycleSeconds() const { return config_.cycle_s; }

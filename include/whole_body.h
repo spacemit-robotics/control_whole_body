@@ -128,6 +128,24 @@ struct whole_body_motor_diagnostic {
     uint32_t error;
 };
 
+/** @brief Latest motor command after mapping and before protocol encoding. */
+struct whole_body_motor_command_diagnostic {
+    bool valid;
+    double age_s;
+    int32_t mode;
+    double position;
+    double velocity;
+    double torque;
+    double kp;
+    double kd;
+};
+
+/** @brief Read-only physical-motor command snapshot. */
+struct whole_body_motor_command_diagnostics {
+    uint32_t motor_count;
+    struct whole_body_motor_command_diagnostic motors[WHOLE_BODY_MAX_MOTORS];
+};
+
 /** @brief Latest state after direct or coupled motor-to-joint mapping. */
 struct whole_body_joint_diagnostic {
     char name[WHOLE_BODY_NAME_LENGTH];
@@ -173,6 +191,8 @@ int whole_body_set_mode(struct whole_body_dev *dev, enum whole_body_mode mode);
 int whole_body_get_health(const struct whole_body_dev *dev, struct whole_body_health *health);
 int whole_body_get_diagnostics(
     const struct whole_body_dev *dev, struct whole_body_diagnostics *diagnostics);
+int whole_body_get_motor_command_diagnostics(const struct whole_body_dev *dev,
+    struct whole_body_motor_command_diagnostics *diagnostics);
 int whole_body_get_cycle_s(const struct whole_body_dev *dev, double *cycle_s);
 const char *whole_body_last_error(const struct whole_body_dev *dev);
 void whole_body_destroy(struct whole_body_dev *dev);

@@ -104,6 +104,7 @@ whole_body:
 | `whole_body_set_mode()` | 切换 POWER_OFF、DAMP、HOME、ZERO、RL 或 SAFETY |
 | `whole_body_get_health()` | 获取读写周期、watchdog 和健康状态 |
 | `whole_body_get_diagnostics()` | 获取物理电机、虚拟关节和 IMU 调试快照 |
+| `whole_body_get_motor_command_diagnostics()` | 获取映射及限幅后的物理电机命令快照 |
 | `whole_body_last_error()` | 获取最近一次错误说明 |
 | `whole_body_destroy()` | 关闭设备并释放资源 |
 
@@ -216,7 +217,9 @@ whole_body:
 
 SAFETY 锁存后，仅切换到 POWER_OFF 才能清除。调用
 `whole_body_get_diagnostics()` 可读取每台物理电机的原始值、极性/零偏校准值、
-反馈年龄和错误码，以及映射后的虚拟关节与 IMU 状态；该接口不会发送控制命令。
+反馈年龄和错误码，以及映射后的虚拟关节与 IMU 状态；
+`whole_body_get_motor_command_diagnostics()` 提供映射/限幅后、协议编码前的最近一次
+电机命令。两个接口都不会发送控制命令。
 
 ## 常见问题
 

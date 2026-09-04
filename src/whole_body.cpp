@@ -80,7 +80,14 @@ int whole_body_get_health(const struct whole_body_dev *dev, struct whole_body_he
 int whole_body_get_diagnostics(
     const struct whole_body_dev *dev, struct whole_body_diagnostics *diagnostics) {
     if (!dev || !dev->core || !diagnostics) return WHOLE_BODY_ERR_STATE;
-    *diagnostics = dev->core->GetDiagnostics();
+    dev->core->GetDiagnostics(diagnostics);
+    return WHOLE_BODY_OK;
+}
+
+int whole_body_get_motor_command_diagnostics(const struct whole_body_dev *dev,
+    struct whole_body_motor_command_diagnostics *diagnostics) {
+    if (!dev || !dev->core || !diagnostics) return WHOLE_BODY_ERR_STATE;
+    dev->core->GetMotorCommandDiagnostics(diagnostics);
     return WHOLE_BODY_OK;
 }
 
