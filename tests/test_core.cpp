@@ -177,7 +177,8 @@ int main() {
     assert(core.Read(&state) == WHOLE_BODY_OK);
     assert(std::abs(state.position[0] + 1.0) < 1.0e-6);
     assert(std::abs(state.position[1] - 0.5) < 1.0e-6);
-    const auto diagnostics = core.GetDiagnostics();
+    whole_body_diagnostics diagnostics{};
+    core.GetDiagnostics(&diagnostics);
     assert(diagnostics.motor_count == 2);
     assert(diagnostics.joint_count == 2);
     assert(std::string(diagnostics.motors[0].name) == "motor_0");
@@ -199,6 +200,13 @@ int main() {
     assert(std::abs(devices_ptr->last_commands[0].pos_des + 0.4f) < 1.0e-6f);
     assert(std::abs(devices_ptr->last_commands[0].trq_des + 1.0f) < 1.0e-6f);
     assert(std::abs(devices_ptr->last_commands[1].pos_des + 0.6f) < 1.0e-6f);
+    whole_body_motor_command_diagnostics command_diagnostics{};
+    core.GetMotorCommandDiagnostics(&command_diagnostics);
+    assert(command_diagnostics.motor_count == 2);
+    assert(command_diagnostics.motors[0].valid);
+    assert(command_diagnostics.motors[0].mode == MOTOR_MODE_HYBRID);
+    assert(std::abs(command_diagnostics.motors[0].position + 0.4) < 1.0e-6);
+    assert(std::abs(command_diagnostics.motors[0].torque + 1.0) < 1.0e-6);
     assert(core.Tick(1.2) == WHOLE_BODY_ERR_TIMEOUT);
     assert(devices_ptr->write_count == 3);
     assert(devices_ptr->last_commands[0].mode == MOTOR_MODE_IDLE);
@@ -320,6 +328,17 @@ int main() {
         assert(std::abs(output.trq_des - expected_motor_torque[i]) < 1.0e-5);
         assert(output.kp == 0.0f);
         assert(output.kd == 0.0f);
+    }
+    whole_body_motor_command_diagnostics parallel_diagnostics{};
+    parallel_core.GetMotorCommandDiagnostics(&parallel_diagnostics);
+    for (size_t i = 0; i < 2; ++i) {
+        assert(parallel_diagnostics.motors[i].valid);
+        assert(std::abs(parallel_diagnostics.motors[i].position -
+            expected_motor_position[i]) < 1.0e-6);
+        assert(std::abs(parallel_diagnostics.motors[i].velocity -
+            expected_motor_velocity[i]) < 1.0e-6);
+        assert(std::abs(parallel_diagnostics.motors[i].torque -
+            expected_motor_torque[i]) < 1.0e-5);
     }
 
     std::array<double, 2> outside_motor_position;

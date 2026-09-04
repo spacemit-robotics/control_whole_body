@@ -33,7 +33,9 @@ class WholeBodyCore {
     int Tick(double monotonic_time_s);
     int SetMode(whole_body_mode mode);
     whole_body_health GetHealth() const;
-    whole_body_diagnostics GetDiagnostics() const;
+    void GetDiagnostics(whole_body_diagnostics *diagnostics) const;
+    void GetMotorCommandDiagnostics(
+        whole_body_motor_command_diagnostics *diagnostics) const;
     double CycleSeconds() const;
     const std::string &LastError() const;
 
@@ -51,6 +53,8 @@ class WholeBodyCore {
         const whole_body_state &state, std::string *reason) const;
     int BuildMotorCommands(
         const whole_body_joint_command &command, std::vector<motor_cmd> *motor_commands);
+    int SendMotorCommands(
+        const std::vector<motor_cmd> &commands, double monotonic_time_s);
     int SendIdle();
     int EnterSafety(int error, const std::string &message);
     std::string DescribeFeedbackProblem(const std::string &prefix) const;
@@ -62,6 +66,7 @@ class WholeBodyCore {
     std::unordered_map<std::string, size_t> joint_indices_;
     std::vector<CouplingRuntime> couplings_;
     std::vector<motor_state> motor_states_;
+    std::vector<motor_cmd> last_motor_commands_;
     std::vector<double> joint_position_;
     std::vector<double> joint_velocity_;
     std::vector<std::array<double, 2>> reference_position_limits_;
@@ -73,9 +78,11 @@ class WholeBodyCore {
     std::string last_error_;
     double last_command_time_s_ = 0.0;
     double last_idle_time_s_ = 0.0;
+    double last_motor_command_time_s_ = 0.0;
     bool initialized_ = false;
     bool has_command_ = false;
     bool has_joint_state_ = false;
+    bool has_motor_command_ = false;
     bool watchdog_active_ = false;
     bool fault_latched_ = false;
 };
