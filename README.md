@@ -105,6 +105,8 @@ whole_body:
 | `whole_body_get_health()` | 获取读写周期、watchdog 和健康状态 |
 | `whole_body_get_diagnostics()` | 获取物理电机、虚拟关节和 IMU 调试快照 |
 | `whole_body_get_motor_command_diagnostics()` | 获取映射及限幅后的物理电机命令快照 |
+| `whole_body_get_diagnostics_v2()` | 获取含接收时间、错误分类和耦合指标的扩展快照 |
+| `whole_body_get_motor_command_diagnostics_v2()` | 获取含估算力矩和变化率的扩展命令快照 |
 | `whole_body_last_error()` | 获取最近一次错误说明 |
 | `whole_body_destroy()` | 关闭设备并释放资源 |
 
@@ -154,7 +156,8 @@ whole_body:
 硬件配置包含：
 
 - `buses`：总线名称、类型、设备和速率。
-- `motors`：驱动、型号、总线、CAN ID、极性、零位和 `driver_options`。
+- `motors`：驱动、型号、总线、CAN ID、极性、零位、错误分类、命令包络和
+  `driver_options`。
 - `joints`：关节映射、位置/速度/力矩限制和阻抗模式。
 - `couplings`：并联机构的几何参数和数值求解限制。
 - `imu`：驱动、设备、波特率、安装矩阵和零偏。
@@ -163,6 +166,27 @@ whole_body:
 `driver_options` 由组件展开为键值项后交给具体外设驱动解析，`whole_body`
 不识别驱动私有协议。完整格式可参考 `tests/data/main.yaml` 和
 `tests/data/hardware.yaml`。
+
+电机级安全项放在对应 `motors` 条目中：
+
+```yaml
+non_fatal_error_codes: [0x04]
+command_limits:
+  kp_max: 500.0
+  kd_max: 5.0
+  estimated_torque_max: 90.0
+  position_rate_max: 0.0
+  velocity_rate_max: 0.0
+  torque_rate_max: 0.0
+```
+
+`non_fatal_error_codes` 按完整错误码匹配，只改变错误分类，不修改驱动返回的原始值。
+列表内错误保留为 warning，其他非零错误触发 SAFETY。`command_limits` 在关节映射之后、协议编码之前检查
+物理电机命令。HYBRID 模式的 `estimated_torque` 按
+`torque + kp * (target_position - position) + kd * (target_velocity - velocity)` 计算，
+TORQUE 模式使用直接力矩目标；位置和速度模式无法从通用接口推导驱动器内部力矩，诊断值为
+`NaN`，不执行该项门限。位置、速度和力矩变化率也只检查当前模式实际使用的命令字段。
+各上限为 `0` 时表示未启用，不能用未经实机验证的猜测值代替标定结果。
 
 ### 行为状态与执行器模式
 
@@ -202,6 +226,10 @@ whole_body:
 `software` 阻抗；组件在关节空间计算 PD 力矩，再通过当前姿态的
 `J^-T` 映射为电机力矩。
 
+并联映射可配置 `jacobian_condition_limit` 和 `torque_amplification_limit`。组件在每次
+反馈解算后计算 Jacobian 条件数和最坏方向的力矩放大倍数；任一已启用阈值超限都会
+进入 SAFETY。阈值为 `0` 时只记录指标，不执行门控。
+
 ### 安全与诊断
 
 `startup_mode: read_only` 只读取反馈，拒绝执行器命令。
@@ -215,11 +243,24 @@ whole_body:
 - 命令包含非有限值或超出配置限制。
 - 关节映射、外设读写或硬件状态异常。
 
-SAFETY 锁存后，仅切换到 POWER_OFF 才能清除。调用
-`whole_body_get_diagnostics()` 可读取每台物理电机的原始值、极性/零偏校准值、
-反馈年龄和错误码，以及映射后的虚拟关节与 IMU 状态；
-`whole_body_get_motor_command_diagnostics()` 提供映射/限幅后、协议编码前的最近一次
-电机命令。两个接口都不会发送控制命令。
+SAFETY 锁存后，仅切换到 POWER_OFF 才能清除。这是 `whole_body` 进程内的硬件执行
+保护；上层 common 会独立保存跨进程故障锁存，即使本地锁存已在 POWER_OFF 清除，
+上层仍需在故障条件消失后由操作者确认，才能再次上电。反馈超时返回
+`WHOLE_BODY_ERR_TIMEOUT`，设备主动报告的致命错误返回 `WHOLE_BODY_ERR_DEVICE`。
+锁存期间重复发送 `SAFETY` 失能命令只会维持失能，不会清除或覆盖最初故障。
+原有 `whole_body_get_diagnostics()` 和 `whole_body_get_motor_command_diagnostics()` 保持
+初始版结构布局，已有二进制调用方可继续使用。扩展诊断使用对应的 `v2` 接口：
+`whole_body_get_diagnostics_v2()` 可读取每台物理电机的原始值、极性/零偏校准值、
+反馈时间、时间来源、年龄以及 raw/warning/fatal 错误码；IMU 同时保留传感器采样时间和主机
+接收时间，并提供有效帧、CRC、解码、重同步和缓冲溢出累计计数。整机
+`feedback_window_s` 表示本次拼帧所用各设备反馈时间的跨度。诊断还包含映射后的
+虚拟关节与并联机构数值指标；
+`whole_body_get_motor_command_diagnostics_v2()` 提供映射/限幅后、协议编码前的最近一次
+电机命令及其估算力矩和变化率。两个接口都不会发送控制命令。
+电机驱动提供真实硬件接收时间时，诊断来源为 `HARDWARE_RECEIVE`，可准确检测缓存状态
+是否过期。旧驱动未提供该时间时，组件保留兼容路径并使用成功读取 API 的完成时间，来源
+明确标为 `READ_COMPLETION`。硬件机型可配置 `require_motor_receive_timestamps: true` 拒绝
+兼容时间，避免通信中断后把重复读取的缓存值误判为新反馈。
 
 ## 常见问题
 

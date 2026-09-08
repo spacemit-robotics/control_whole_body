@@ -14,6 +14,8 @@
 #include <cstdio>
 #include <cstring>
 #include <iomanip>
+#include <iterator>
+#include <limits>
 #include <sstream>
 #include <stdexcept>
 #include <utility>
@@ -34,6 +36,23 @@ bool IsValidMode(whole_body_mode mode) {
 
 bool IsValidActuationMode(whole_body_actuation_mode mode) {
     return mode >= WHOLE_BODY_ACTUATION_HYBRID && mode <= WHOLE_BODY_ACTUATION_TORQUE;
+}
+
+bool MotorModeUsesPosition(uint32_t mode) {
+    return mode == MOTOR_MODE_HYBRID || mode == MOTOR_MODE_POS;
+}
+
+bool MotorModeUsesVelocity(uint32_t mode) {
+    return mode == MOTOR_MODE_HYBRID || mode == MOTOR_MODE_POS ||
+        mode == MOTOR_MODE_VEL;
+}
+
+bool MotorModeUsesTorque(uint32_t mode) {
+    return mode == MOTOR_MODE_HYBRID || mode == MOTOR_MODE_TRQ;
+}
+
+bool MotorModeUsesGains(uint32_t mode) {
+    return mode == MOTOR_MODE_HYBRID;
 }
 
 motor_mode ToMotorMode(whole_body_actuation_mode mode) {
@@ -152,6 +171,7 @@ WholeBodyCore::WholeBodyCore(RuntimeConfig config, std::unique_ptr<DeviceManager
     }
     motor_states_.resize(config_.motors.size());
     last_motor_commands_.resize(config_.motors.size());
+    last_motor_command_metrics_.resize(config_.motors.size());
     joint_position_.resize(config_.joints.size());
     joint_velocity_.resize(config_.joints.size());
     health_.state = WHOLE_BODY_HEALTH_CREATED;
@@ -198,8 +218,12 @@ int WholeBodyCore::Read(whole_body_state *state) {
         return Fail(WHOLE_BODY_ERR_STATE,
             DescribeFeedbackProblem("waiting for initial feedback"));
     }
+    if (read_result == DEVICE_READ_INCOMPATIBLE) {
+        return EnterSafety(WHOLE_BODY_ERR_CONFIG,
+            DescribeFeedbackProblem("motor feedback timestamp requirement not met"));
+    }
     if (read_result < 0) {
-        return EnterSafety(WHOLE_BODY_ERR_DEVICE,
+        return EnterSafety(WHOLE_BODY_ERR_TIMEOUT,
             DescribeFeedbackProblem("feedback timed out"));
     }
     if (std::any_of(motor_states_.begin(), motor_states_.end(),
@@ -208,9 +232,9 @@ int WholeBodyCore::Read(whole_body_state *state) {
         return EnterSafety(
             WHOLE_BODY_ERR_STATE, "motor or IMU feedback contains non-finite data");
     }
-    if (std::any_of(motor_states_.begin(), motor_states_.end(),
-            [](const motor_state &motor) { return motor.err != 0; })) {
-        return EnterSafety(WHOLE_BODY_ERR_DEVICE, DescribeMotorErrors());
+    for (size_t i = 0; i < motor_states_.size(); ++i) {
+        if (FatalMotorError(i) != 0)
+            return EnterSafety(WHOLE_BODY_ERR_DEVICE, DescribeMotorErrors());
     }
 
     std::memset(state, 0, sizeof(*state));
@@ -238,7 +262,7 @@ int WholeBodyCore::Read(whole_body_state *state) {
         state->motor_error[joint_index] = motor_states_[motor_index].err;
     }
 
-    for (const auto &coupling : couplings_) {
+    for (auto &coupling : couplings_) {
         const std::array<double, 2> coupled_motor_position = {
             motor_position[coupling.motor_indices[0]],
             motor_position[coupling.motor_indices[1]],
@@ -261,6 +285,23 @@ int WholeBodyCore::Read(whole_body_state *state) {
                 joint_position, coupled_motor_torque, &joint_torque)) {
             return EnterSafety(
                 WHOLE_BODY_ERR_STATE, "parallel ankle feedback is outside its solvable domain");
+        }
+        coupling.metrics_valid = coupling.mapping.Metrics(joint_position,
+            &coupling.jacobian_condition, &coupling.torque_amplification);
+        if (!coupling.metrics_valid) {
+            return EnterSafety(
+                WHOLE_BODY_ERR_STATE, "parallel ankle Jacobian is singular");
+        }
+        const auto &coupling_config = coupling.mapping.Config();
+        if ((coupling_config.jacobian_condition_limit > 0.0 &&
+                coupling.jacobian_condition > coupling_config.jacobian_condition_limit) ||
+            (coupling_config.torque_amplification_limit > 0.0 &&
+                coupling.torque_amplification > coupling_config.torque_amplification_limit)) {
+            std::ostringstream message;
+            message << "parallel ankle mapping exceeds safety limit: condition="
+                    << coupling.jacobian_condition << ", torque_amplification="
+                    << coupling.torque_amplification;
+            return EnterSafety(WHOLE_BODY_ERR_STATE, message.str());
         }
         for (size_t side = 0; side < 2; ++side) {
             const size_t joint_index = coupling.joint_indices[side];
@@ -550,6 +591,118 @@ int WholeBodyCore::BuildMotorCommands(
     return WHOLE_BODY_OK;
 }
 
+bool WholeBodyCore::ValidateMotorCommands(const std::vector<motor_cmd> &commands,
+    double monotonic_time_s, std::vector<MotorCommandMetrics> *metrics,
+    std::string *reason) const {
+    if (!metrics || commands.size() != config_.motors.size()) {
+        if (reason) *reason = "motor command count does not match configuration";
+        return false;
+    }
+    metrics->assign(commands.size(), MotorCommandMetrics{});
+    const double command_interval_s = monotonic_time_s - last_motor_command_time_s_;
+    for (size_t i = 0; i < commands.size(); ++i) {
+        const auto &command = commands[i];
+        const auto &motor = config_.motors[i];
+        const auto &limits = motor.command_limits;
+        auto fail_limit = [&](const char *field, double value, double limit) {
+            if (reason) {
+                std::ostringstream message;
+                message << motor.name << "." << field << "=" << value
+                        << " exceeds limit " << limit;
+                *reason = message.str();
+            }
+            return false;
+        };
+        const std::array<std::pair<const char *, double>, 5> fields = {{
+            {"position", command.pos_des},
+            {"velocity", command.vel_des},
+            {"torque", command.trq_des},
+            {"kp", command.kp},
+            {"kd", command.kd},
+        }};
+        for (const auto &field : fields) {
+            if (std::isfinite(field.second)) continue;
+            if (reason) *reason = motor.name + "." + field.first + " is not finite";
+            return false;
+        }
+        if (command.mode > MOTOR_MODE_HYBRID || command.kp < 0.0f || command.kd < 0.0f) {
+            if (reason) *reason = motor.name + " has an invalid mode or negative gain";
+            return false;
+        }
+        if (command.mode == MOTOR_MODE_IDLE) continue;
+        const bool uses_position = MotorModeUsesPosition(command.mode);
+        const bool uses_velocity = MotorModeUsesVelocity(command.mode);
+        const bool uses_torque = MotorModeUsesTorque(command.mode);
+        const bool uses_gains = MotorModeUsesGains(command.mode);
+        if (uses_gains && limits.kp_max > 0.0 && command.kp > limits.kp_max)
+            return fail_limit("kp", command.kp, limits.kp_max);
+        if (uses_gains && limits.kd_max > 0.0 && command.kd > limits.kd_max)
+            return fail_limit("kd", command.kd, limits.kd_max);
+
+        const bool has_feedback = i < feedback_status_.motor_received.size() &&
+            i < feedback_status_.motor_fresh.size() &&
+            feedback_status_.motor_received[i] != 0 &&
+            feedback_status_.motor_fresh[i] != 0;
+        double estimated_torque = std::numeric_limits<double>::quiet_NaN();
+        if (command.mode == MOTOR_MODE_TRQ) {
+            estimated_torque = command.trq_des;
+        } else if (command.mode == MOTOR_MODE_HYBRID) {
+            estimated_torque = command.trq_des;
+            if (has_feedback) {
+                estimated_torque += command.kp * (command.pos_des - motor_states_[i].pos) +
+                    command.kd * (command.vel_des - motor_states_[i].vel);
+            } else if (limits.estimated_torque_max > 0.0) {
+                if (reason) *reason = motor.name + " has no feedback for torque estimation";
+                return false;
+            }
+        }
+        (*metrics)[i].estimated_torque = estimated_torque;
+        if (std::isfinite(estimated_torque) && limits.estimated_torque_max > 0.0 &&
+            std::abs(estimated_torque) > limits.estimated_torque_max) {
+            return fail_limit("estimated_torque", std::abs(estimated_torque),
+                limits.estimated_torque_max);
+        }
+
+        if (!has_motor_command_ || last_motor_commands_[i].mode == MOTOR_MODE_IDLE ||
+            last_motor_commands_[i].mode != command.mode) {
+            continue;
+        }
+        const bool check_position_rate = uses_position && limits.position_rate_max > 0.0;
+        const bool check_velocity_rate = uses_velocity && limits.velocity_rate_max > 0.0;
+        const bool check_torque_rate = uses_torque && limits.torque_rate_max > 0.0;
+        const bool rate_limit_enabled =
+            check_position_rate || check_velocity_rate || check_torque_rate;
+        if (rate_limit_enabled && command_interval_s <= 0.0) {
+            if (reason) *reason = "motor command timestamp did not advance";
+            return false;
+        }
+        if (command_interval_s <= 0.0) continue;
+        auto &output = (*metrics)[i];
+        if (uses_position) {
+            output.position_rate =
+                std::abs(command.pos_des - last_motor_commands_[i].pos_des) /
+                command_interval_s;
+        }
+        if (uses_velocity) {
+            output.velocity_rate =
+                std::abs(command.vel_des - last_motor_commands_[i].vel_des) /
+                command_interval_s;
+        }
+        if (uses_torque) {
+            output.torque_rate =
+                std::abs(command.trq_des - last_motor_commands_[i].trq_des) /
+                command_interval_s;
+        }
+        if (check_position_rate && output.position_rate > limits.position_rate_max)
+            return fail_limit("position_rate", output.position_rate, limits.position_rate_max);
+        if (check_velocity_rate && output.velocity_rate > limits.velocity_rate_max)
+            return fail_limit("velocity_rate", output.velocity_rate, limits.velocity_rate_max);
+        if (check_torque_rate && output.torque_rate > limits.torque_rate_max)
+            return fail_limit("torque_rate", output.torque_rate, limits.torque_rate_max);
+    }
+    return true;
+}
+
 int WholeBodyCore::Write(const whole_body_joint_command &command, double monotonic_time_s) {
     if (!initialized_) return Fail(WHOLE_BODY_ERR_STATE, "whole-body backend is not initialized");
     if (config_.read_only || !config_.allow_actuation) {
@@ -566,7 +719,10 @@ int WholeBodyCore::Write(const whole_body_joint_command &command, double monoton
             WHOLE_BODY_ERR_COMMAND, "joint command failed validation: " + validation_error);
     }
     const bool resets_safety = command.mode == WHOLE_BODY_MODE_POWER_OFF;
-    if ((watchdog_active_ || fault_latched_) && !resets_safety) {
+    const bool accepts_latched_fault = resets_safety ||
+        (command.mode == WHOLE_BODY_MODE_SAFETY && !command.enable);
+    const bool fault_was_latched = watchdog_active_ || fault_latched_;
+    if (fault_was_latched && !accepts_latched_fault) {
         return health_.last_error != WHOLE_BODY_OK ? health_.last_error : WHOLE_BODY_ERR_STATE;
     }
     if (command.enable && command.mode != WHOLE_BODY_MODE_POWER_OFF && has_joint_state_ &&
@@ -578,7 +734,13 @@ int WholeBodyCore::Write(const whole_body_joint_command &command, double monoton
     const int build_result = BuildMotorCommands(command, &motor_commands);
     if (build_result != WHOLE_BODY_OK)
         return EnterSafety(build_result, "failed to map joint command to motor space");
-    if (SendMotorCommands(motor_commands, monotonic_time_s) != WHOLE_BODY_OK)
+    std::vector<MotorCommandMetrics> command_metrics;
+    if (!ValidateMotorCommands(
+            motor_commands, monotonic_time_s, &command_metrics, &validation_error)) {
+        return EnterSafety(WHOLE_BODY_ERR_COMMAND,
+            "motor command failed validation: " + validation_error);
+    }
+    if (SendMotorCommands(motor_commands, monotonic_time_s, &command_metrics) != WHOLE_BODY_OK)
         return EnterSafety(WHOLE_BODY_ERR_DEVICE, "failed to write motor commands");
     mode_ = command.mode;
     const bool idle_request = !command.enable || command.mode == WHOLE_BODY_MODE_POWER_OFF;
@@ -591,9 +753,11 @@ int WholeBodyCore::Write(const whole_body_joint_command &command, double monoton
     if (command.mode == WHOLE_BODY_MODE_SAFETY && !command.enable) {
         watchdog_active_ = false;
         fault_latched_ = true;
-        health_.last_error = WHOLE_BODY_ERR_STATE;
-        health_.state = WHOLE_BODY_HEALTH_ERROR;
-        last_error_ = "whole-body safety mode requested";
+        if (!fault_was_latched) {
+            health_.last_error = WHOLE_BODY_ERR_STATE;
+            health_.state = WHOLE_BODY_HEALTH_ERROR;
+            last_error_ = "whole-body safety mode requested";
+        }
     } else if (resets_safety) {
         watchdog_active_ = false;
         fault_latched_ = false;
@@ -609,9 +773,14 @@ int WholeBodyCore::Write(const whole_body_joint_command &command, double monoton
 }
 
 int WholeBodyCore::SendMotorCommands(
-    const std::vector<motor_cmd> &commands, double monotonic_time_s) {
+    const std::vector<motor_cmd> &commands, double monotonic_time_s,
+    const std::vector<MotorCommandMetrics> *metrics) {
     if (devices_->Write(commands) < 0) return WHOLE_BODY_ERR_DEVICE;
     last_motor_commands_ = commands;
+    if (metrics && metrics->size() == commands.size())
+        last_motor_command_metrics_ = *metrics;
+    else
+        last_motor_command_metrics_.assign(commands.size(), MotorCommandMetrics{});
     last_motor_command_time_s_ = monotonic_time_s;
     has_motor_command_ = true;
     return WHOLE_BODY_OK;
@@ -679,7 +848,8 @@ int WholeBodyCore::SetMode(whole_body_mode mode) {
         mode_ = mode;
         return WHOLE_BODY_OK;
     }
-    if ((watchdog_active_ || fault_latched_) && mode != WHOLE_BODY_MODE_POWER_OFF &&
+    const bool fault_was_latched = watchdog_active_ || fault_latched_;
+    if (fault_was_latched && mode != WHOLE_BODY_MODE_POWER_OFF &&
         mode != WHOLE_BODY_MODE_SAFETY) {
         return health_.last_error != WHOLE_BODY_OK ? health_.last_error : WHOLE_BODY_ERR_STATE;
     }
@@ -701,9 +871,11 @@ int WholeBodyCore::SetMode(whole_body_mode mode) {
         has_command_ = false;
         watchdog_active_ = false;
         fault_latched_ = true;
-        health_.last_error = WHOLE_BODY_ERR_STATE;
-        health_.state = WHOLE_BODY_HEALTH_ERROR;
-        last_error_ = "whole-body safety mode requested";
+        if (!fault_was_latched) {
+            health_.last_error = WHOLE_BODY_ERR_STATE;
+            health_.state = WHOLE_BODY_HEALTH_ERROR;
+            last_error_ = "whole-body safety mode requested";
+        }
     }
     return WHOLE_BODY_OK;
 }
@@ -717,7 +889,12 @@ std::string WholeBodyCore::DescribeFeedbackProblem(const std::string &prefix) co
             feedback_status_.motor_received[i] != 0;
         const bool fresh = i < feedback_status_.motor_fresh.size() &&
             feedback_status_.motor_fresh[i] != 0;
-        if (received && fresh) continue;
+        const auto timestamp_source = i < feedback_status_.motor_timestamp_source.size()
+            ? feedback_status_.motor_timestamp_source[i]
+            : WHOLE_BODY_FEEDBACK_TIMESTAMP_NONE;
+        const bool incompatible_timestamp = config_.require_motor_receive_timestamps &&
+            timestamp_source != WHOLE_BODY_FEEDBACK_TIMESTAMP_HARDWARE_RECEIVE;
+        if (received && fresh && !incompatible_timestamp) continue;
         const auto &motor = config_.motors[i];
         const double age_s = i < feedback_status_.motor_age_s.size()
             ? feedback_status_.motor_age_s[i]
@@ -726,7 +903,9 @@ std::string WholeBodyCore::DescribeFeedbackProblem(const std::string &prefix) co
                 << "/" << BusDevice(config_, motor.bus)
                 << ",cmd=0x" << std::hex << motor.command_id << ",fb=0x"
                 << motor.feedback_id << std::dec << ",age_ms=" << std::fixed
-                << std::setprecision(1) << age_s * 1000.0 << ")";
+                << std::setprecision(1) << age_s * 1000.0;
+        if (incompatible_timestamp) message << ",timestamp=read_completion";
+        message << ")";
         has_detail = true;
     }
     if (!feedback_status_.imu_received || !feedback_status_.imu_fresh) {
@@ -743,25 +922,40 @@ std::string WholeBodyCore::DescribeMotorErrors() const {
     message << "motor hardware error";
     bool has_detail = false;
     for (size_t i = 0; i < motor_states_.size(); ++i) {
-        if (motor_states_[i].err == 0) continue;
+        const uint32_t fatal_error = FatalMotorError(i);
+        if (fatal_error == 0) continue;
         const auto &motor = config_.motors[i];
         message << (has_detail ? ", " : ": ") << motor.name << "(" << motor.bus
                 << "/" << BusDevice(config_, motor.bus)
-                << ",fb=0x" << std::hex << motor.feedback_id << ",err=0x"
-                << motor_states_[i].err << std::dec << ")";
+                << ",fb=0x" << std::hex << motor.feedback_id << ",raw=0x"
+                << motor_states_[i].err << ",fatal=0x" << fatal_error << std::dec << ")";
         has_detail = true;
     }
     return message.str();
 }
 
+uint32_t WholeBodyCore::FatalMotorError(size_t index) const {
+    if (index >= motor_states_.size() || index >= config_.motors.size()) return 0;
+    return IsNonFatalMotorError(index) ? 0 : motor_states_[index].err;
+}
+
+bool WholeBodyCore::IsNonFatalMotorError(size_t index) const {
+    if (index >= motor_states_.size() || index >= config_.motors.size()) return false;
+    const uint32_t error = motor_states_[index].err;
+    const auto &codes = config_.motors[index].non_fatal_error_codes;
+    return error != 0 && std::find(codes.begin(), codes.end(), error) != codes.end();
+}
+
 whole_body_health WholeBodyCore::GetHealth() const { return health_; }
 
-void WholeBodyCore::GetDiagnostics(whole_body_diagnostics *diagnostics) const {
+void WholeBodyCore::GetDiagnosticsV2(whole_body_diagnostics_v2 *diagnostics) const {
     if (!diagnostics) return;
     *diagnostics = {};
     diagnostics->timestamp_s = last_state_.timestamp_s;
+    diagnostics->feedback_window_s = feedback_status_.feedback_window_s;
     diagnostics->motor_count = static_cast<uint32_t>(config_.motors.size());
     diagnostics->joint_count = static_cast<uint32_t>(config_.joints.size());
+    diagnostics->coupling_count = static_cast<uint32_t>(couplings_.size());
     diagnostics->health = health_;
 
     for (size_t i = 0; i < config_.motors.size(); ++i) {
@@ -795,6 +989,10 @@ void WholeBodyCore::GetDiagnostics(whole_body_diagnostics *diagnostics) const {
             feedback_status_.motor_fresh[i] != 0;
         if (i < feedback_status_.motor_age_s.size())
             output.feedback_age_s = feedback_status_.motor_age_s[i];
+        if (i < feedback_status_.motor_timestamp_s.size())
+            output.feedback_timestamp_s = feedback_status_.motor_timestamp_s[i];
+        if (i < feedback_status_.motor_timestamp_source.size())
+            output.feedback_timestamp_source = feedback_status_.motor_timestamp_source[i];
         if (output.feedback_received) {
             output.raw_position = motor_states_[i].pos;
             output.raw_velocity = motor_states_[i].vel;
@@ -805,6 +1003,8 @@ void WholeBodyCore::GetDiagnostics(whole_body_diagnostics *diagnostics) const {
             output.calibrated_torque = config.polarity * motor_states_[i].trq;
             output.temperature = motor_states_[i].temp;
             output.error = motor_states_[i].err;
+            output.warning_error = IsNonFatalMotorError(i) ? motor_states_[i].err : 0;
+            output.fatal_error = FatalMotorError(i);
         }
     }
 
@@ -825,6 +1025,16 @@ void WholeBodyCore::GetDiagnostics(whole_body_diagnostics *diagnostics) const {
     diagnostics->imu.feedback_received = feedback_status_.imu_received;
     diagnostics->imu.feedback_fresh = feedback_status_.imu_fresh;
     diagnostics->imu.feedback_age_s = feedback_status_.imu_age_s;
+    diagnostics->imu.sample_timestamp_s = feedback_status_.imu_sample_timestamp_s;
+    diagnostics->imu.receive_timestamp_s = feedback_status_.imu_receive_timestamp_s;
+    diagnostics->imu.valid_frames = feedback_status_.imu_parser.valid_frames;
+    diagnostics->imu.crc_errors = feedback_status_.imu_parser.crc_errors;
+    diagnostics->imu.decode_errors = feedback_status_.imu_parser.decode_errors;
+    diagnostics->imu.superseded_frames = feedback_status_.imu_parser.superseded_frames;
+    diagnostics->imu.resync_discarded_bytes =
+        feedback_status_.imu_parser.resync_discarded_bytes;
+    diagnostics->imu.overflow_discarded_bytes =
+        feedback_status_.imu_parser.overflow_discarded_bytes;
     if (feedback_status_.imu_received) {
         for (size_t i = 0; i < 4; ++i) diagnostics->imu.quaternion[i] = imu_state_.quat[i];
         for (size_t i = 0; i < 3; ++i) {
@@ -832,10 +1042,20 @@ void WholeBodyCore::GetDiagnostics(whole_body_diagnostics *diagnostics) const {
             diagnostics->imu.acceleration[i] = imu_state_.acc[i];
         }
     }
+    for (size_t i = 0; i < couplings_.size(); ++i) {
+        auto &output = diagnostics->couplings[i];
+        const auto &coupling = couplings_[i];
+        const std::string names = config_.joints[coupling.joint_indices[0]].name + "+" +
+            config_.joints[coupling.joint_indices[1]].name;
+        CopyText(names, output.joint_names, sizeof(output.joint_names));
+        output.valid = coupling.metrics_valid;
+        output.jacobian_condition = coupling.jacobian_condition;
+        output.torque_amplification = coupling.torque_amplification;
+    }
 }
 
-void WholeBodyCore::GetMotorCommandDiagnostics(
-    whole_body_motor_command_diagnostics *diagnostics) const {
+void WholeBodyCore::GetMotorCommandDiagnosticsV2(
+    whole_body_motor_command_diagnostics_v2 *diagnostics) const {
     if (!diagnostics) return;
     *diagnostics = {};
     diagnostics->motor_count = static_cast<uint32_t>(config_.motors.size());
@@ -854,6 +1074,82 @@ void WholeBodyCore::GetMotorCommandDiagnostics(
         output.torque = command.trq_des;
         output.kp = command.kp;
         output.kd = command.kd;
+        if (i < last_motor_command_metrics_.size()) {
+            output.estimated_torque = last_motor_command_metrics_[i].estimated_torque;
+            output.position_rate = last_motor_command_metrics_[i].position_rate;
+            output.velocity_rate = last_motor_command_metrics_[i].velocity_rate;
+            output.torque_rate = last_motor_command_metrics_[i].torque_rate;
+        }
+    }
+}
+
+void WholeBodyCore::GetDiagnostics(whole_body_diagnostics *diagnostics) const {
+    if (!diagnostics) return;
+    whole_body_diagnostics_v2 extended{};
+    GetDiagnosticsV2(&extended);
+    *diagnostics = {};
+    diagnostics->timestamp_s = extended.timestamp_s;
+    diagnostics->motor_count = extended.motor_count;
+    diagnostics->joint_count = extended.joint_count;
+    diagnostics->health = extended.health;
+    for (uint32_t i = 0; i < extended.motor_count; ++i) {
+        const auto &source = extended.motors[i];
+        auto &output = diagnostics->motors[i];
+        std::memcpy(output.name, source.name, sizeof(output.name));
+        std::memcpy(output.joint_names, source.joint_names, sizeof(output.joint_names));
+        std::memcpy(output.driver, source.driver, sizeof(output.driver));
+        std::memcpy(output.model, source.model, sizeof(output.model));
+        std::memcpy(output.bus, source.bus, sizeof(output.bus));
+        std::memcpy(output.device, source.device, sizeof(output.device));
+        output.command_id = source.command_id;
+        output.feedback_id = source.feedback_id;
+        output.feedback_received = source.feedback_received;
+        output.feedback_fresh = source.feedback_fresh;
+        output.feedback_age_s = source.feedback_age_s;
+        output.raw_position = source.raw_position;
+        output.raw_velocity = source.raw_velocity;
+        output.raw_torque = source.raw_torque;
+        output.calibrated_position = source.calibrated_position;
+        output.calibrated_velocity = source.calibrated_velocity;
+        output.calibrated_torque = source.calibrated_torque;
+        output.temperature = source.temperature;
+        output.error = source.error;
+    }
+    for (uint32_t i = 0; i < extended.joint_count; ++i)
+        diagnostics->joints[i] = extended.joints[i];
+    std::memcpy(diagnostics->imu.driver, extended.imu.driver,
+        sizeof(diagnostics->imu.driver));
+    std::memcpy(diagnostics->imu.device, extended.imu.device,
+        sizeof(diagnostics->imu.device));
+    diagnostics->imu.feedback_received = extended.imu.feedback_received;
+    diagnostics->imu.feedback_fresh = extended.imu.feedback_fresh;
+    diagnostics->imu.feedback_age_s = extended.imu.feedback_age_s;
+    std::copy(std::begin(extended.imu.quaternion), std::end(extended.imu.quaternion),
+        diagnostics->imu.quaternion);
+    std::copy(std::begin(extended.imu.gyro), std::end(extended.imu.gyro),
+        diagnostics->imu.gyro);
+    std::copy(std::begin(extended.imu.acceleration), std::end(extended.imu.acceleration),
+        diagnostics->imu.acceleration);
+}
+
+void WholeBodyCore::GetMotorCommandDiagnostics(
+    whole_body_motor_command_diagnostics *diagnostics) const {
+    if (!diagnostics) return;
+    whole_body_motor_command_diagnostics_v2 extended{};
+    GetMotorCommandDiagnosticsV2(&extended);
+    *diagnostics = {};
+    diagnostics->motor_count = extended.motor_count;
+    for (uint32_t i = 0; i < extended.motor_count; ++i) {
+        const auto &source = extended.motors[i];
+        auto &output = diagnostics->motors[i];
+        output.valid = source.valid;
+        output.age_s = source.age_s;
+        output.mode = source.mode;
+        output.position = source.position;
+        output.velocity = source.velocity;
+        output.torque = source.torque;
+        output.kp = source.kp;
+        output.kd = source.kd;
     }
 }
 

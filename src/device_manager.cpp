@@ -36,6 +36,8 @@ public:
         motors_.reserve(config_.motors.size());
         motor_feedback_valid_.assign(config_.motors.size(), false);
         motor_feedback_time_s_.assign(config_.motors.size(), 0.0);
+        motor_feedback_timestamp_source_.assign(config_.motors.size(),
+            WHOLE_BODY_FEEDBACK_TIMESTAMP_NONE);
         for (const auto &motor : config_.motors) {
             const auto bus = buses.find(motor.bus);
             if (bus == buses.end()) throw std::runtime_error("unknown motor bus");
@@ -88,53 +90,106 @@ public:
             motors->size() != motors_.size()) {
             return -1;
         }
-        const double now = MonotonicTime();
         status->motor_received.assign(motors_.size(), 0);
         status->motor_fresh.assign(motors_.size(), 0);
         status->motor_age_s.assign(motors_.size(), 0.0);
-        bool waiting_for_first_sample = false;
-        bool feedback_timed_out = false;
+        status->motor_timestamp_s.assign(motors_.size(), 0.0);
+        status->motor_timestamp_source.assign(
+            motors_.size(), WHOLE_BODY_FEEDBACK_TIMESTAMP_NONE);
         for (size_t i = 0; i < motors_.size(); ++i) {
             motor_state current{};
             if (motor_get_state_one(motors_[i], &current) == 0) {
+                uint64_t timestamp_us = 0;
+
                 (*motors)[i] = current;
+                (void)motor_get_feedback_timestamp_one(motors_[i], &timestamp_us);
                 motor_feedback_valid_[i] = true;
-                motor_feedback_time_s_[i] = now;
-            } else if (!motor_feedback_valid_[i]) {
-                if (now - feedback_start_time_s_ > config_.startup_feedback_timeout_s)
-                    feedback_timed_out = true;
-                else
-                    waiting_for_first_sample = true;
-            } else if (now - motor_feedback_time_s_[i] > config_.feedback_timeout_s) {
-                feedback_timed_out = true;
+                if (timestamp_us > 0) {
+                    motor_feedback_time_s_[i] =
+                        static_cast<double>(timestamp_us) * 1.0e-6;
+                    motor_feedback_timestamp_source_[i] =
+                        WHOLE_BODY_FEEDBACK_TIMESTAMP_HARDWARE_RECEIVE;
+                } else {
+                    motor_feedback_time_s_[i] = MonotonicTime();
+                    motor_feedback_timestamp_source_[i] =
+                        WHOLE_BODY_FEEDBACK_TIMESTAMP_READ_COMPLETION;
+                }
             }
-            status->motor_received[i] = motor_feedback_valid_[i];
-            status->motor_age_s[i] = motor_feedback_valid_[i]
-                ? now - motor_feedback_time_s_[i]
-                : now - feedback_start_time_s_;
-            status->motor_fresh[i] = motor_feedback_valid_[i] &&
-                status->motor_age_s[i] <= config_.feedback_timeout_s;
         }
 
         imu_data current_imu{};
-        if (imu_read(imu_, &current_imu) == 0) {
+        const bool received_imu = imu_read(imu_, &current_imu) == 0;
+        if (received_imu) {
             *imu = current_imu;
             imu_feedback_valid_ = true;
-            imu_feedback_time_s_ = now;
-        } else if (!imu_feedback_valid_) {
-            if (now - feedback_start_time_s_ > config_.startup_feedback_timeout_s)
-                feedback_timed_out = true;
-            else
-                waiting_for_first_sample = true;
-        } else if (now - imu_feedback_time_s_ > config_.feedback_timeout_s) {
-            feedback_timed_out = true;
+        }
+        (void)imu_get_diagnostics(imu_, &status->imu_parser);
+        if (imu_feedback_valid_ && status->imu_parser.receive_timestamp_us > 0) {
+            imu_feedback_time_s_ =
+                static_cast<double>(status->imu_parser.receive_timestamp_us) * 1.0e-6;
+        } else if (received_imu) {
+            imu_feedback_time_s_ = MonotonicTime();
+        }
+
+        const double now = MonotonicTime();
+        bool waiting_for_first_sample = false;
+        bool feedback_timed_out = false;
+        bool incompatible_timestamp = false;
+        double earliest_timestamp_s = 0.0;
+        double latest_timestamp_s = 0.0;
+        for (size_t i = 0; i < motors_.size(); ++i) {
+            status->motor_received[i] = motor_feedback_valid_[i];
+            status->motor_timestamp_s[i] = motor_feedback_time_s_[i];
+            status->motor_timestamp_source[i] = motor_feedback_timestamp_source_[i];
+            status->motor_age_s[i] = motor_feedback_valid_[i]
+                ? std::max(0.0, now - motor_feedback_time_s_[i])
+                : now - feedback_start_time_s_;
+            status->motor_fresh[i] = motor_feedback_valid_[i] &&
+                status->motor_age_s[i] <= config_.feedback_timeout_s;
+            if (!motor_feedback_valid_[i]) {
+                if (status->motor_age_s[i] > config_.startup_feedback_timeout_s)
+                    feedback_timed_out = true;
+                else
+                    waiting_for_first_sample = true;
+                continue;
+            }
+            if (!status->motor_fresh[i]) feedback_timed_out = true;
+            if (config_.require_motor_receive_timestamps &&
+                motor_feedback_timestamp_source_[i] !=
+                    WHOLE_BODY_FEEDBACK_TIMESTAMP_HARDWARE_RECEIVE) {
+                incompatible_timestamp = true;
+            }
+            const double timestamp_s = motor_feedback_time_s_[i];
+            if (earliest_timestamp_s == 0.0 || timestamp_s < earliest_timestamp_s)
+                earliest_timestamp_s = timestamp_s;
+            latest_timestamp_s = std::max(latest_timestamp_s, timestamp_s);
         }
         status->imu_received = imu_feedback_valid_;
+        status->imu_sample_timestamp_s = imu_feedback_valid_
+            ? static_cast<double>(imu->timestamp_us) * 1.0e-6
+            : 0.0;
+        status->imu_receive_timestamp_s = imu_feedback_time_s_;
         status->imu_age_s = imu_feedback_valid_
-            ? now - imu_feedback_time_s_
+            ? std::max(0.0, now - imu_feedback_time_s_)
             : now - feedback_start_time_s_;
         status->imu_fresh = imu_feedback_valid_ &&
             status->imu_age_s <= config_.feedback_timeout_s;
+        if (!imu_feedback_valid_) {
+            if (status->imu_age_s > config_.startup_feedback_timeout_s)
+                feedback_timed_out = true;
+            else
+                waiting_for_first_sample = true;
+        } else if (!status->imu_fresh) {
+            feedback_timed_out = true;
+        } else {
+            if (earliest_timestamp_s == 0.0 || imu_feedback_time_s_ < earliest_timestamp_s)
+                earliest_timestamp_s = imu_feedback_time_s_;
+            latest_timestamp_s = std::max(latest_timestamp_s, imu_feedback_time_s_);
+        }
+        status->feedback_window_s = earliest_timestamp_s > 0.0
+            ? latest_timestamp_s - earliest_timestamp_s
+            : 0.0;
+        if (incompatible_timestamp) return DEVICE_READ_INCOMPATIBLE;
         if (feedback_timed_out) return DEVICE_READ_ERROR;
         return waiting_for_first_sample ? DEVICE_READ_WAITING : DEVICE_READ_OK;
     }
@@ -179,6 +234,7 @@ private:
     std::vector<motor_dev *> motors_;
     std::vector<bool> motor_feedback_valid_;
     std::vector<double> motor_feedback_time_s_;
+    std::vector<whole_body_feedback_timestamp_source> motor_feedback_timestamp_source_;
     imu_dev *imu_ = nullptr;
     double feedback_start_time_s_ = 0.0;
     double imu_feedback_time_s_ = 0.0;
