@@ -9,10 +9,13 @@
 #include "device_manager.h"
 
 #include <algorithm>
+#include <array>
+#include <cerrno>
 #include <chrono>
 #include <cstdint>
 #include <cstring>
 #include <memory>
+#include <sstream>
 #include <stdexcept>
 #include <string>
 #include <unordered_map>
@@ -195,9 +198,13 @@ public:
     }
 
     int Write(const std::vector<motor_cmd> &commands) override {
-        if (!initialized_ || commands.size() != motors_.size()) return -1;
+        if (!initialized_ || commands.size() != motors_.size()) {
+            last_write_error_ = !initialized_
+                ? "motor devices are not initialized" : "invalid motor command batch";
+            return -1;
+        }
         wrote_command_ = true;
-        return motor_set_cmds(motors_.data(), commands.data(), motors_.size());
+        return WriteMotorCommands(config_, motors_, commands, &last_write_error_);
     }
 
     void Shutdown() override {
@@ -244,6 +251,57 @@ private:
 };
 
 }  // namespace
+
+int WriteMotorCommands(const RuntimeConfig &config, const std::vector<motor_dev *> &motors,
+    const std::vector<motor_cmd> &commands, std::string *error, MotorCommandWriter write_command) {
+    if (!error) return -1;
+    error->clear();
+    if (!write_command || commands.size() != motors.size() ||
+        config.motors.size() != motors.size() || motors.size() > WHOLE_BODY_MAX_MOTORS) {
+        *error = "invalid motor command batch";
+        return -1;
+    }
+
+    struct WriteFailure {
+        size_t index;
+        int result;
+        int system_error;
+    };
+    std::array<WriteFailure, WHOLE_BODY_MAX_MOTORS> failures;
+    size_t failure_count = 0;
+    for (size_t i = 0; i < motors.size(); ++i) {
+        errno = 0;
+        const int result = write_command(motors[i], &commands[i]);
+        if (result < 0) failures[failure_count++] = {i, result, errno};
+    }
+    if (failure_count == 0) return 0;
+
+    // Finish the entire batch, including disable commands, before formatting errors.
+    std::ostringstream message;
+    for (size_t i = 0; i < failure_count; ++i) {
+        const auto &failure = failures[i];
+        const auto &motor = config.motors[failure.index];
+        const auto bus = std::find_if(config.buses.begin(), config.buses.end(),
+            [&motor](const BusConfig &entry) { return entry.name == motor.bus; });
+        if (i != 0) message << ", ";
+        message << motor.name << "(driver=" << motor.driver << ",bus=" << motor.bus;
+        if (bus != config.buses.end()) message << "/" << bus->device;
+        message << ",cmd=0x" << std::hex << motor.command_id
+                << ",fb=0x" << motor.feedback_id << std::dec
+                << ",operation=" << (commands[failure.index].mode == MOTOR_MODE_IDLE
+                    ? "disable" : "command")
+                << ",mode=" << commands[failure.index].mode
+                << ",ret=" << failure.result << ",errno=";
+        if (failure.system_error != 0) {
+            message << failure.system_error << " (" << std::strerror(failure.system_error) << ")";
+        } else {
+            message << "unavailable";
+        }
+        message << ")";
+    }
+    *error = message.str();
+    return failures[0].result;
+}
 
 std::vector<DriverOption> BuildMotorDriverOptions(const MotorConfig &motor) {
     std::vector<DriverOption> options = motor.driver_options;

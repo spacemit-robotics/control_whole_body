@@ -76,6 +76,7 @@ class WholeBodyCore {
     int EnterSafety(int error, const std::string &message);
     std::string DescribeFeedbackProblem(const std::string &prefix) const;
     std::string DescribeMotorErrors() const;
+    std::string DescribeWriteFailure(const std::string &prefix) const;
     bool IsNonFatalMotorError(size_t index) const;
     uint32_t FatalMotorError(size_t index) const;
 

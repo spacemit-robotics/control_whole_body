@@ -20,6 +20,10 @@ C 接口，可作为 `humanoid_common` 的实机 driver backend。
 - 位置、速度、力矩、KP/KD 命令及关节、IMU 状态反馈。
 - read-only / disabled 启动门控、反馈超时、命令 watchdog 和 SAFETY 锁存。
 - 物理电机、虚拟关节、IMU 和运行健康状态诊断。
+- 命令或失能发送失败时，通过 `whole_body_last_error()` 报告失败电机名称、驱动、
+  总线与设备、命令和反馈 ID、操作、控制模式、驱动返回值及系统错误。
+  一批命令中的全部电机仍会尝试发送；多个失败分别列出。
+  驱动未提供系统错误时标记为 `errno=unavailable`。
 - 使用 fake 设备完成配置、映射和安全逻辑的离线测试。
 
 不包含：

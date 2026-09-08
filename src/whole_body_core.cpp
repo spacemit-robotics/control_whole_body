@@ -194,9 +194,10 @@ int WholeBodyCore::Init() {
         return Fail(WHOLE_BODY_ERR_DEVICE, "failed to initialize motor or IMU devices");
     initialized_ = true;
     if (!config_.read_only && config_.allow_actuation && SendIdle() != WHOLE_BODY_OK) {
+        const std::string message = DescribeWriteFailure("failed to establish disabled startup state");
         devices_->Shutdown();
         initialized_ = false;
-        return Fail(WHOLE_BODY_ERR_DEVICE, "failed to establish disabled startup state");
+        return Fail(WHOLE_BODY_ERR_DEVICE, message);
     }
     mode_ = WHOLE_BODY_MODE_POWER_OFF;
     has_command_ = false;
@@ -741,7 +742,7 @@ int WholeBodyCore::Write(const whole_body_joint_command &command, double monoton
             "motor command failed validation: " + validation_error);
     }
     if (SendMotorCommands(motor_commands, monotonic_time_s, &command_metrics) != WHOLE_BODY_OK)
-        return EnterSafety(WHOLE_BODY_ERR_DEVICE, "failed to write motor commands");
+        return EnterSafety(WHOLE_BODY_ERR_DEVICE, DescribeWriteFailure("failed to write motor commands"));
     mode_ = command.mode;
     const bool idle_request = !command.enable || command.mode == WHOLE_BODY_MODE_POWER_OFF;
     if (idle_request) {
@@ -800,7 +801,8 @@ int WholeBodyCore::EnterSafety(int error, const std::string &message) {
     fault_latched_ = true;
     mode_ = WHOLE_BODY_MODE_SAFETY;
     if (can_write && SendIdle() != WHOLE_BODY_OK) {
-        return Fail(WHOLE_BODY_ERR_DEVICE, message + "; failed to disable motors");
+        return Fail(WHOLE_BODY_ERR_DEVICE,
+            message + "; " + DescribeWriteFailure("failed to disable motors"));
     }
     return Fail(error, message);
 }
@@ -814,7 +816,8 @@ int WholeBodyCore::Tick(double monotonic_time_s) {
     if (disabled_mode &&
         monotonic_time_s - last_idle_time_s_ >= config_.cycle_s) {
         if (SendIdle() != WHOLE_BODY_OK)
-            return Fail(WHOLE_BODY_ERR_DEVICE, "failed to maintain disabled motor state");
+            return Fail(WHOLE_BODY_ERR_DEVICE,
+                DescribeWriteFailure("failed to maintain disabled motor state"));
         last_idle_time_s_ = monotonic_time_s;
     }
     if (!has_command_ || watchdog_active_ || fault_latched_ ||
@@ -822,7 +825,7 @@ int WholeBodyCore::Tick(double monotonic_time_s) {
         return WHOLE_BODY_OK;
     }
     if (SendIdle() != WHOLE_BODY_OK)
-        return Fail(WHOLE_BODY_ERR_DEVICE, "watchdog failed to disable motors");
+        return Fail(WHOLE_BODY_ERR_DEVICE, DescribeWriteFailure("watchdog failed to disable motors"));
     watchdog_active_ = true;
     has_command_ = false;
     mode_ = WHOLE_BODY_MODE_SAFETY;
@@ -855,7 +858,8 @@ int WholeBodyCore::SetMode(whole_body_mode mode) {
     }
     if ((mode == WHOLE_BODY_MODE_POWER_OFF || mode == WHOLE_BODY_MODE_SAFETY) &&
         SendIdle() != WHOLE_BODY_OK) {
-        return EnterSafety(WHOLE_BODY_ERR_DEVICE, "failed to enter a safe whole-body mode");
+        return EnterSafety(WHOLE_BODY_ERR_DEVICE,
+            DescribeWriteFailure("failed to enter a safe whole-body mode"));
     }
     mode_ = mode;
     if (mode == WHOLE_BODY_MODE_POWER_OFF || mode == WHOLE_BODY_MODE_SAFETY)
@@ -915,6 +919,11 @@ std::string WholeBodyCore::DescribeFeedbackProblem(const std::string &prefix) co
         has_detail = true;
     }
     return has_detail ? message.str() : prefix;
+}
+
+std::string WholeBodyCore::DescribeWriteFailure(const std::string &prefix) const {
+    const std::string &detail = devices_->LastWriteError();
+    return detail.empty() ? prefix : prefix + ": " + detail;
 }
 
 std::string WholeBodyCore::DescribeMotorErrors() const {

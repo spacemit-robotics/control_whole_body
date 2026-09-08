@@ -11,6 +11,7 @@
 
 #include <cstdint>
 #include <memory>
+#include <string>
 #include <vector>
 
 extern "C" {
@@ -53,7 +54,16 @@ public:
         DeviceFeedbackStatus *status) = 0;
     virtual int Write(const std::vector<motor_cmd> &commands) = 0;
     virtual void Shutdown() = 0;
+    const std::string &LastWriteError() const { return last_write_error_; }
+
+protected:
+    std::string last_write_error_;
 };
+
+using MotorCommandWriter = int (*)(motor_dev *, const motor_cmd *);
+int WriteMotorCommands(const RuntimeConfig &config, const std::vector<motor_dev *> &motors,
+    const std::vector<motor_cmd> &commands, std::string *error,
+    MotorCommandWriter write_command = motor_set_cmd_one);
 
 std::vector<DriverOption> BuildMotorDriverOptions(const MotorConfig &motor);
 std::unique_ptr<DeviceManager> CreatePeripheralDevices(const RuntimeConfig &config);

@@ -12,6 +12,7 @@
 #include <cstring>
 #include <iostream>
 #include <memory>
+#include <string>
 #include <utility>
 #include <vector>
 
@@ -50,15 +51,25 @@ class DummyDevices final : public whole_body::DeviceManager {
         if (!initialized) return -1;
         last_commands = commands;
         ++write_count;
+        if (next_write_failure < write_failures.size()) {
+            last_write_error_ = write_failures[next_write_failure++];
+            return -1;
+        }
+        last_write_error_.clear();
         return 0;
     }
 
-    void Shutdown() override { initialized = false; }
+    void Shutdown() override {
+        initialized = false;
+        last_write_error_.clear();
+    }
 
     std::vector<motor_state> feedback = std::vector<motor_state>(2);
     std::vector<motor_cmd> last_commands;
     int write_count = 0;
     int read_result = 0;
+    std::vector<std::string> write_failures;
+    size_t next_write_failure = 0;
     bool initialized = false;
 };
 
@@ -673,6 +684,71 @@ int main() {
     mode_command.actuation_mode = static_cast<whole_body_actuation_mode>(-1);
     assert(mode_core.Write(mode_command, 1.07) == WHOLE_BODY_ERR_COMMAND);
     assert(mode_devices_ptr->last_commands[0].mode == MOTOR_MODE_IDLE);
+    {
+        auto failing_devices = std::make_unique<DummyDevices>();
+        failing_devices->write_failures = {"startup_motor errno=105"};
+        whole_body::WholeBodyCore failing_core(MakeConfig(false), std::move(failing_devices));
+        assert(failing_core.Init() == WHOLE_BODY_ERR_DEVICE);
+        assert(failing_core.LastError() ==
+            "failed to establish disabled startup state: startup_motor errno=105");
+    }
+    {
+        auto failing_devices = std::make_unique<DummyDevices>();
+        auto *failing_ptr = failing_devices.get();
+        whole_body::WholeBodyCore failing_core(MakeConfig(false), std::move(failing_devices));
+        assert(failing_core.Init() == WHOLE_BODY_OK);
+        failing_ptr->write_failures = {"command_motor errno=105", "disable_motor errno=100"};
+        assert(failing_core.Write(MakeCommand(), 1.0) == WHOLE_BODY_ERR_DEVICE);
+        assert(failing_core.LastError() == "failed to write motor commands: command_motor errno=105; "
+            "failed to disable motors: disable_motor errno=100");
+        assert(failing_ptr->write_count == 3);
+        assert(failing_ptr->last_commands[0].mode == MOTOR_MODE_IDLE);
+    }
+    {
+        auto failing_devices = std::make_unique<DummyDevices>();
+        auto *failing_ptr = failing_devices.get();
+        whole_body::WholeBodyCore failing_core(MakeConfig(false), std::move(failing_devices));
+        assert(failing_core.Init() == WHOLE_BODY_OK);
+        failing_ptr->write_failures = {"command_motor errno=105"};
+        assert(failing_core.Write(MakeCommand(), 1.0) == WHOLE_BODY_ERR_DEVICE);
+        assert(failing_core.LastError() == "failed to write motor commands: command_motor errno=105");
+        failing_ptr->write_failures.push_back("idle_motor errno=100");
+        assert(failing_core.Tick(2.0) == WHOLE_BODY_ERR_DEVICE);
+        assert(failing_core.LastError() ==
+            "failed to maintain disabled motor state: idle_motor errno=100");
+    }
+    {
+        auto failing_devices = std::make_unique<DummyDevices>();
+        auto *failing_ptr = failing_devices.get();
+        whole_body::WholeBodyCore failing_core(MakeConfig(false), std::move(failing_devices));
+        assert(failing_core.Init() == WHOLE_BODY_OK);
+        assert(failing_core.Write(MakeCommand(), 1.0) == WHOLE_BODY_OK);
+        failing_ptr->write_failures = {"watchdog_motor errno=105"};
+        assert(failing_core.Tick(2.0) == WHOLE_BODY_ERR_DEVICE);
+        assert(failing_core.LastError() == "watchdog failed to disable motors: watchdog_motor errno=105");
+    }
+    {
+        auto failing_devices = std::make_unique<DummyDevices>();
+        auto *failing_ptr = failing_devices.get();
+        whole_body::WholeBodyCore failing_core(MakeConfig(false), std::move(failing_devices));
+        assert(failing_core.Init() == WHOLE_BODY_OK);
+        failing_ptr->write_failures = {"mode_motor errno=105"};
+        assert(failing_core.SetMode(WHOLE_BODY_MODE_SAFETY) == WHOLE_BODY_ERR_DEVICE);
+        assert(failing_core.LastError() == "failed to enter a safe whole-body mode: mode_motor errno=105");
+    }
+    {
+        auto failing_devices = std::make_unique<DummyDevices>();
+        auto *failing_ptr = failing_devices.get();
+        whole_body::WholeBodyCore failing_core(MakeConfig(false), std::move(failing_devices));
+        assert(failing_core.Init() == WHOLE_BODY_OK);
+        failing_ptr->feedback[0].err = 1;
+        failing_ptr->write_failures = {"disable_motor errno=105"};
+        whole_body_state feedback{};
+        assert(failing_core.Read(&feedback) == WHOLE_BODY_ERR_DEVICE);
+        assert(failing_core.LastError().find("motor hardware error: motor_0") != std::string::npos);
+        assert(failing_core.LastError().find("; failed to disable motors: disable_motor errno=105") !=
+            std::string::npos);
+    }
     std::cout << "Whole-body core tests passed\n";
     return 0;
 }
