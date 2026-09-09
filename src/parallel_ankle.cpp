@@ -40,6 +40,26 @@ std::array<double, 2> Multiply(
         matrix[2] * vector[0] + matrix[3] * vector[1]};
 }
 
+bool JacobianMetrics(const std::array<double, 4> &jacobian,
+    double *condition, double *torque_amplification) {
+    if (!condition || !torque_amplification) return false;
+    const double trace = jacobian[0] * jacobian[0] + jacobian[1] * jacobian[1] +
+        jacobian[2] * jacobian[2] + jacobian[3] * jacobian[3];
+    const double determinant =
+        jacobian[0] * jacobian[3] - jacobian[1] * jacobian[2];
+    const double discriminant =
+        std::sqrt(std::max(0.0, trace * trace - 4.0 * determinant * determinant));
+    const double largest = 0.5 * (trace + discriminant);
+    const double smallest = 0.5 * (trace - discriminant);
+    if (smallest <= kMinimumDenominator || !std::isfinite(largest) ||
+        !std::isfinite(smallest)) {
+        return false;
+    }
+    *condition = std::sqrt(largest / smallest);
+    *torque_amplification = 1.0 / std::sqrt(smallest);
+    return std::isfinite(*condition) && std::isfinite(*torque_amplification);
+}
+
 }  // namespace
 
 ParallelAnkle::ParallelAnkle(ParallelAnkleConfig config) : config_(std::move(config)) {
@@ -205,6 +225,14 @@ bool ParallelAnkle::MotorTorqueToJoint(const std::array<double, 2> &joint,
     *joint_torque = {jacobian[0] * motor_torque[0] + jacobian[2] * motor_torque[1],
         jacobian[1] * motor_torque[0] + jacobian[3] * motor_torque[1]};
     return true;
+}
+
+bool ParallelAnkle::Metrics(const std::array<double, 2> &joint,
+    double *jacobian_condition, double *torque_amplification) const {
+    std::array<double, 2> motor;
+    std::array<double, 4> jacobian;
+    return Compute(joint, &motor, &jacobian) &&
+        JacobianMetrics(jacobian, jacobian_condition, torque_amplification);
 }
 
 }  // namespace whole_body

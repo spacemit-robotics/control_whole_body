@@ -52,6 +52,15 @@ void RequireFinite(double value, const std::string &path) {
     if (!std::isfinite(value)) throw std::runtime_error(path + " must be finite");
 }
 
+double OptionalNonnegative(
+    const YAML::Node &node, const char *key, const std::string &path) {
+    if (!node[key]) return 0.0;
+    const double value = Required<double>(node, key, path);
+    RequireFinite(value, path + "." + key);
+    if (value < 0.0) throw std::runtime_error(path + "." + key + " must be non-negative");
+    return value;
+}
+
 ImpedanceMode ReadImpedanceMode(const YAML::Node &node, const std::string &path) {
     const std::string mode = Required<std::string>(node, "mode", path);
     if (mode == "motor") return ImpedanceMode::kMotor;
@@ -277,14 +286,18 @@ RuntimeConfig LoadConfig(const std::string &main_config_path) {
     const YAML::Node root = hardware["whole_body"];
     CheckKeys(root,
         {"cycle_s", "startup_feedback_timeout_s", "feedback_timeout_s",
-            "command_timeout_s", "startup_mode", "allow_actuation", "buses", "motors",
-            "joints", "couplings", "imu"},
+            "command_timeout_s", "require_motor_receive_timestamps", "startup_mode",
+            "allow_actuation", "buses", "motors", "joints", "couplings", "imu"},
         "whole_body");
     config.cycle_s = Required<double>(root, "cycle_s", "whole_body");
     config.startup_feedback_timeout_s =
         Required<double>(root, "startup_feedback_timeout_s", "whole_body");
     config.feedback_timeout_s = Required<double>(root, "feedback_timeout_s", "whole_body");
     config.command_timeout_s = Required<double>(root, "command_timeout_s", "whole_body");
+    if (root["require_motor_receive_timestamps"]) {
+        config.require_motor_receive_timestamps =
+            Required<bool>(root, "require_motor_receive_timestamps", "whole_body");
+    }
     RequireFinite(config.cycle_s, "whole_body.cycle_s");
     RequireFinite(
         config.startup_feedback_timeout_s, "whole_body.startup_feedback_timeout_s");
@@ -340,7 +353,7 @@ RuntimeConfig LoadConfig(const std::string &main_config_path) {
         const std::string path = "whole_body.motors[" + std::to_string(i) + "]";
         CheckKeys(motors[i],
             {"name", "driver", "bus", "model", "command_id", "feedback_id", "polarity",
-                "zero_offset", "driver_options"},
+                "zero_offset", "non_fatal_error_codes", "command_limits", "driver_options"},
             path);
         MotorConfig motor;
         motor.name = Required<std::string>(motors[i], "name", path);
@@ -351,6 +364,30 @@ RuntimeConfig LoadConfig(const std::string &main_config_path) {
         motor.feedback_id = Required<uint16_t>(motors[i], "feedback_id", path);
         motor.polarity = Required<double>(motors[i], "polarity", path);
         motor.zero_offset = Required<double>(motors[i], "zero_offset", path);
+        if (motors[i]["non_fatal_error_codes"]) {
+            motor.non_fatal_error_codes = Required<std::vector<uint32_t>>(
+                motors[i], "non_fatal_error_codes", path);
+        }
+        const YAML::Node command_limits = motors[i]["command_limits"];
+        if (command_limits) {
+            const std::string limits_path = path + ".command_limits";
+            CheckKeys(command_limits,
+                {"kp_max", "kd_max", "estimated_torque_max", "position_rate_max",
+                    "velocity_rate_max", "torque_rate_max"},
+                limits_path);
+            motor.command_limits.kp_max =
+                OptionalNonnegative(command_limits, "kp_max", limits_path);
+            motor.command_limits.kd_max =
+                OptionalNonnegative(command_limits, "kd_max", limits_path);
+            motor.command_limits.estimated_torque_max =
+                OptionalNonnegative(command_limits, "estimated_torque_max", limits_path);
+            motor.command_limits.position_rate_max =
+                OptionalNonnegative(command_limits, "position_rate_max", limits_path);
+            motor.command_limits.velocity_rate_max =
+                OptionalNonnegative(command_limits, "velocity_rate_max", limits_path);
+            motor.command_limits.torque_rate_max =
+                OptionalNonnegative(command_limits, "torque_rate_max", limits_path);
+        }
         const YAML::Node driver_options = motors[i]["driver_options"];
         if (driver_options) {
             if (!driver_options.IsMap())
@@ -432,7 +469,8 @@ RuntimeConfig LoadConfig(const std::string &main_config_path) {
         CheckKeys(couplings[i],
             {"type", "joints", "motors", "ankle_pivots", "ball_positions", "motor_positions",
                 "motor_bias", "motor_limit", "ankle_limit", "motor_difference_limit",
-                "max_iterations", "squared_tolerance"},
+                "max_iterations", "squared_tolerance", "jacobian_condition_limit",
+                "torque_amplification_limit"},
             path);
         if (Required<std::string>(couplings[i], "type", path) != "parallel_ankle")
             throw std::runtime_error(path + ".type is unsupported");
@@ -458,6 +496,10 @@ RuntimeConfig LoadConfig(const std::string &main_config_path) {
             Required<double>(couplings[i], "motor_difference_limit", path);
         coupling.max_iterations = Required<int>(couplings[i], "max_iterations", path);
         coupling.squared_tolerance = Required<double>(couplings[i], "squared_tolerance", path);
+        coupling.jacobian_condition_limit =
+            OptionalNonnegative(couplings[i], "jacobian_condition_limit", path);
+        coupling.torque_amplification_limit =
+            OptionalNonnegative(couplings[i], "torque_amplification_limit", path);
         RequireFinite(coupling.motor_limit, path + ".motor_limit");
         RequireFinite(coupling.ankle_limit, path + ".ankle_limit");
         RequireFinite(coupling.motor_difference_limit, path + ".motor_difference_limit");

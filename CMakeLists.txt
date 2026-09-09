@@ -114,10 +114,24 @@ if(BUILD_TESTS)
     endif()
     add_test(NAME whole_body_core COMMAND test_whole_body_core)
 
+    add_executable(test_motor_write_errors tests/test_motor_write_errors.cpp)
+    target_include_directories(test_motor_write_errors BEFORE PRIVATE
+        ${CMAKE_CURRENT_SOURCE_DIR}/include
+        ${CMAKE_CURRENT_SOURCE_DIR}/src
+        ${MOTOR_INCLUDE_DIR}
+        ${IMU_INCLUDE_DIR}
+    )
+    target_link_libraries(test_motor_write_errors PRIVATE whole_body)
+    if(CMAKE_CXX_COMPILER_ID MATCHES "GNU|Clang")
+        target_compile_options(test_motor_write_errors PRIVATE -UNDEBUG)
+    endif()
+    add_test(NAME motor_write_errors COMMAND test_motor_write_errors)
+
     install(TARGETS
         test_whole_body_config
         test_parallel_ankle
         test_whole_body_core
+        test_motor_write_errors
         RUNTIME DESTINATION bin
     )
 endif()

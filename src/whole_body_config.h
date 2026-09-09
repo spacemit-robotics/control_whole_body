@@ -28,6 +28,15 @@ struct DriverOption {
     std::string value;
 };
 
+struct MotorCommandLimits {
+    double kp_max = 0.0;
+    double kd_max = 0.0;
+    double estimated_torque_max = 0.0;
+    double position_rate_max = 0.0;
+    double velocity_rate_max = 0.0;
+    double torque_rate_max = 0.0;
+};
+
 struct MotorConfig {
     std::string name;
     std::string driver;
@@ -37,6 +46,8 @@ struct MotorConfig {
     uint16_t feedback_id = 0;
     double polarity = 1.0;
     double zero_offset = 0.0;
+    std::vector<uint32_t> non_fatal_error_codes;
+    MotorCommandLimits command_limits;
     std::vector<DriverOption> driver_options;
 };
 
@@ -80,6 +91,8 @@ struct ParallelAnkleConfig {
     double motor_difference_limit = 0.0;
     int max_iterations = 0;
     double squared_tolerance = 0.0;
+    double jacobian_condition_limit = 0.0;
+    double torque_amplification_limit = 0.0;
 };
 
 struct ImuConfig {
@@ -100,6 +113,7 @@ struct RuntimeConfig {
     double startup_feedback_timeout_s = 0.0;
     double feedback_timeout_s = 0.0;
     double command_timeout_s = 0.0;
+    bool require_motor_receive_timestamps = false;
     bool read_only = true;
     bool allow_actuation = false;
     std::vector<std::string> joint_names;

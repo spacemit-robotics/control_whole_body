@@ -31,6 +31,9 @@ class ParallelAnkle {
         const std::array<double, 2> &joint_torque, std::array<double, 2> *motor_torque) const;
     bool MotorTorqueToJoint(const std::array<double, 2> &joint,
         const std::array<double, 2> &motor_torque, std::array<double, 2> *joint_torque) const;
+    bool Metrics(const std::array<double, 2> &joint, double *jacobian_condition,
+        double *torque_amplification) const;
+    const ParallelAnkleConfig &Config() const { return config_; }
 
     private:
     bool Compute(const std::array<double, 2> &joint, std::array<double, 2> *motor,

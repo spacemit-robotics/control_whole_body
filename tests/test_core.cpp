@@ -12,6 +12,7 @@
 #include <cstring>
 #include <iostream>
 #include <memory>
+#include <string>
 #include <utility>
 #include <vector>
 
@@ -50,15 +51,25 @@ class DummyDevices final : public whole_body::DeviceManager {
         if (!initialized) return -1;
         last_commands = commands;
         ++write_count;
+        if (next_write_failure < write_failures.size()) {
+            last_write_error_ = write_failures[next_write_failure++];
+            return -1;
+        }
+        last_write_error_.clear();
         return 0;
     }
 
-    void Shutdown() override { initialized = false; }
+    void Shutdown() override {
+        initialized = false;
+        last_write_error_.clear();
+    }
 
     std::vector<motor_state> feedback = std::vector<motor_state>(2);
     std::vector<motor_cmd> last_commands;
     int write_count = 0;
     int read_result = 0;
+    std::vector<std::string> write_failures;
+    size_t next_write_failure = 0;
     bool initialized = false;
 };
 
@@ -207,6 +218,10 @@ int main() {
     assert(command_diagnostics.motors[0].mode == MOTOR_MODE_HYBRID);
     assert(std::abs(command_diagnostics.motors[0].position + 0.4) < 1.0e-6);
     assert(std::abs(command_diagnostics.motors[0].torque + 1.0) < 1.0e-6);
+    whole_body_motor_command_diagnostics_v2 command_diagnostics_v2{};
+    core.GetMotorCommandDiagnosticsV2(&command_diagnostics_v2);
+    assert(command_diagnostics_v2.motor_count == 2);
+    assert(std::isfinite(command_diagnostics_v2.motors[0].estimated_torque));
     assert(core.Tick(1.2) == WHOLE_BODY_ERR_TIMEOUT);
     assert(devices_ptr->write_count == 3);
     assert(devices_ptr->last_commands[0].mode == MOTOR_MODE_IDLE);
@@ -216,7 +231,105 @@ int main() {
     assert(core.Write(command, 1.3) == WHOLE_BODY_ERR_TIMEOUT);
     assert(devices_ptr->write_count == 3);
     assert(core.SetMode(WHOLE_BODY_MODE_POWER_OFF) == WHOLE_BODY_OK);
-    assert(devices_ptr->write_count == 4);
+
+    auto warning_config = MakeConfig(false);
+    warning_config.motors[0].non_fatal_error_codes = {0x04U};
+    auto warning_devices = std::make_unique<DummyDevices>();
+    DummyDevices *warning_devices_ptr = warning_devices.get();
+    warning_devices_ptr->feedback[0].err = 0x04U;
+    whole_body::WholeBodyCore warning_core(
+        std::move(warning_config), std::move(warning_devices));
+    assert(warning_core.Init() == WHOLE_BODY_OK);
+    whole_body_state warning_state{};
+    assert(warning_core.Read(&warning_state) == WHOLE_BODY_OK);
+    whole_body_diagnostics_v2 warning_diagnostics{};
+    warning_core.GetDiagnosticsV2(&warning_diagnostics);
+    assert(warning_diagnostics.motors[0].error == 0x04U);
+    assert(warning_diagnostics.motors[0].warning_error == 0x04U);
+    assert(warning_diagnostics.motors[0].fatal_error == 0U);
+    warning_devices_ptr->feedback[0].err = 0x08U;
+    assert(warning_core.Read(&warning_state) == WHOLE_BODY_ERR_DEVICE);
+    assert(warning_core.LastError().find("fatal=0x8") != std::string::npos);
+    warning_devices_ptr->feedback[0].err = 0x05U;
+    assert(warning_core.Read(&warning_state) == WHOLE_BODY_ERR_DEVICE);
+    warning_core.GetDiagnosticsV2(&warning_diagnostics);
+    assert(warning_diagnostics.motors[0].error == 0x05U);
+    assert(warning_diagnostics.motors[0].warning_error == 0U);
+    assert(warning_diagnostics.motors[0].fatal_error == 0x05U);
+
+    auto torque_limit_config = MakeConfig(false);
+    torque_limit_config.motors[0].command_limits.estimated_torque_max = 5.0;
+    auto torque_limit_devices = std::make_unique<DummyDevices>();
+    DummyDevices *torque_limit_devices_ptr = torque_limit_devices.get();
+    torque_limit_devices_ptr->feedback[0].pos = 1.1f;
+    whole_body::WholeBodyCore torque_limit_core(
+        std::move(torque_limit_config), std::move(torque_limit_devices));
+    assert(torque_limit_core.Init() == WHOLE_BODY_OK);
+    whole_body_state torque_limit_state{};
+    assert(torque_limit_core.Read(&torque_limit_state) == WHOLE_BODY_OK);
+    assert(torque_limit_core.Write(MakeCommand(), 1.0) == WHOLE_BODY_ERR_COMMAND);
+    assert(torque_limit_core.LastError().find("estimated_torque") != std::string::npos);
+
+    auto rate_limit_config = MakeConfig(false);
+    rate_limit_config.motors[0].command_limits.position_rate_max = 1.0;
+    auto rate_limit_devices = std::make_unique<DummyDevices>();
+    DummyDevices *rate_limit_devices_ptr = rate_limit_devices.get();
+    whole_body::WholeBodyCore rate_limit_core(
+        std::move(rate_limit_config), std::move(rate_limit_devices));
+    assert(rate_limit_core.Init() == WHOLE_BODY_OK);
+    whole_body_state rate_limit_state{};
+    assert(rate_limit_core.Read(&rate_limit_state) == WHOLE_BODY_OK);
+    auto first_rate_command = MakeCommand();
+    assert(rate_limit_core.Write(first_rate_command, 1.0) == WHOLE_BODY_OK);
+    first_rate_command.position[0] += 0.1;
+    assert(rate_limit_core.Write(first_rate_command, 1.01) == WHOLE_BODY_ERR_COMMAND);
+    assert(rate_limit_core.LastError().find("position_rate") != std::string::npos);
+    assert(rate_limit_devices_ptr->write_count == 3);
+
+    auto mode_limit_config = MakeConfig(false);
+    mode_limit_config.motors[0].command_limits.estimated_torque_max = 0.5;
+    mode_limit_config.motors[0].command_limits.position_rate_max = 1.0;
+    mode_limit_config.motors[0].command_limits.velocity_rate_max = 1.0;
+    mode_limit_config.motors[0].command_limits.torque_rate_max = 1.0;
+    auto mode_limit_devices = std::make_unique<DummyDevices>();
+    whole_body::WholeBodyCore mode_limit_core(
+        std::move(mode_limit_config), std::move(mode_limit_devices));
+    assert(mode_limit_core.Init() == WHOLE_BODY_OK);
+    whole_body_state mode_limit_state{};
+    assert(mode_limit_core.Read(&mode_limit_state) == WHOLE_BODY_OK);
+    auto position_mode_command = MakeCommand();
+    position_mode_command.actuation_mode = WHOLE_BODY_ACTUATION_POSITION;
+    assert(mode_limit_core.Write(position_mode_command, 1.0) == WHOLE_BODY_OK);
+    position_mode_command.torque[0] += 1.0;
+    position_mode_command.kp[0] += 100.0;
+    assert(mode_limit_core.Write(position_mode_command, 1.01) == WHOLE_BODY_OK);
+    whole_body_motor_command_diagnostics_v2 position_mode_diagnostics{};
+    mode_limit_core.GetMotorCommandDiagnosticsV2(&position_mode_diagnostics);
+    assert(std::isnan(position_mode_diagnostics.motors[0].estimated_torque));
+    assert(position_mode_diagnostics.motors[0].torque_rate == 0.0);
+    position_mode_command.position[0] += 0.1;
+    assert(mode_limit_core.Write(position_mode_command, 1.02) == WHOLE_BODY_ERR_COMMAND);
+    assert(mode_limit_core.LastError().find("position_rate") != std::string::npos);
+
+    auto torque_mode_limit_config = MakeConfig(false);
+    torque_mode_limit_config.motors[0].command_limits.estimated_torque_max = 2.0;
+    torque_mode_limit_config.motors[0].command_limits.position_rate_max = 1.0;
+    torque_mode_limit_config.motors[0].command_limits.velocity_rate_max = 1.0;
+    torque_mode_limit_config.motors[0].command_limits.torque_rate_max = 200.0;
+    auto torque_mode_limit_devices = std::make_unique<DummyDevices>();
+    whole_body::WholeBodyCore torque_mode_limit_core(
+        std::move(torque_mode_limit_config), std::move(torque_mode_limit_devices));
+    assert(torque_mode_limit_core.Init() == WHOLE_BODY_OK);
+    assert(torque_mode_limit_core.Read(&mode_limit_state) == WHOLE_BODY_OK);
+    auto torque_mode_command = MakeCommand();
+    torque_mode_command.actuation_mode = WHOLE_BODY_ACTUATION_TORQUE;
+    assert(torque_mode_limit_core.Write(torque_mode_command, 1.0) == WHOLE_BODY_OK);
+    torque_mode_command.position[0] += 0.1;
+    torque_mode_command.velocity[0] += 0.1;
+    assert(torque_mode_limit_core.Write(torque_mode_command, 1.01) == WHOLE_BODY_OK);
+    torque_mode_command.torque[0] += 2.0;
+    assert(torque_mode_limit_core.Write(torque_mode_command, 1.02) == WHOLE_BODY_ERR_COMMAND);
+    assert(torque_mode_limit_core.LastError().find("estimated_torque") != std::string::npos);
 
     auto damp_command = MakeCommand();
     damp_command.mode = WHOLE_BODY_MODE_DAMP;
@@ -228,16 +341,38 @@ int main() {
     assert(std::abs(devices_ptr->last_commands[0].pos_des - 0.1f) < 1.0e-6f);
 
     devices_ptr->read_result = -1;
-    assert(core.Read(&state) == WHOLE_BODY_ERR_DEVICE);
+    assert(core.Read(&state) == WHOLE_BODY_ERR_TIMEOUT);
     assert(devices_ptr->write_count == 6);
     assert(devices_ptr->last_commands[0].mode == MOTOR_MODE_IDLE);
     assert(core.GetHealth().state == WHOLE_BODY_HEALTH_ERROR);
     devices_ptr->read_result = 0;
     assert(core.Read(&state) == WHOLE_BODY_OK);
     assert(core.GetHealth().state == WHOLE_BODY_HEALTH_ERROR);
-    assert(core.Write(command, 1.5) == WHOLE_BODY_ERR_DEVICE);
+    assert(core.Write(command, 1.5) == WHOLE_BODY_ERR_TIMEOUT);
     assert(devices_ptr->write_count == 6);
     assert(core.SetMode(WHOLE_BODY_MODE_POWER_OFF) == WHOLE_BODY_OK);
+
+    auto fault_devices = std::make_unique<DummyDevices>();
+    DummyDevices *fault_devices_ptr = fault_devices.get();
+    whole_body::WholeBodyCore fault_core(MakeConfig(false), std::move(fault_devices));
+    assert(fault_core.Init() == WHOLE_BODY_OK);
+    whole_body_state fault_state{};
+    assert(fault_core.Read(&fault_state) == WHOLE_BODY_OK);
+    fault_devices_ptr->read_result = -1;
+    assert(fault_core.Read(&fault_state) == WHOLE_BODY_ERR_TIMEOUT);
+    const std::string root_fault = fault_core.LastError();
+    auto fault_safety_command = MakeCommand();
+    fault_safety_command.mode = WHOLE_BODY_MODE_SAFETY;
+    fault_safety_command.enable = false;
+    assert(fault_core.Write(fault_safety_command, 1.1) == WHOLE_BODY_OK);
+    assert(fault_devices_ptr->last_commands[0].mode == MOTOR_MODE_IDLE);
+    assert(fault_core.GetHealth().last_error == WHOLE_BODY_ERR_TIMEOUT);
+    assert(fault_core.LastError() == root_fault);
+    assert(fault_core.SetMode(WHOLE_BODY_MODE_SAFETY) == WHOLE_BODY_OK);
+    assert(fault_core.GetHealth().last_error == WHOLE_BODY_ERR_TIMEOUT);
+    assert(fault_core.LastError() == root_fault);
+    assert(fault_core.Write(command, 1.2) == WHOLE_BODY_ERR_TIMEOUT);
+    assert(fault_core.SetMode(WHOLE_BODY_MODE_POWER_OFF) == WHOLE_BODY_OK);
 
     assert(core.Write(command, 1.6) == WHOLE_BODY_OK);
     auto out_of_range_command = MakeCommand();
@@ -291,6 +426,12 @@ int main() {
     assert(parallel_core.Read(&parallel_state) == WHOLE_BODY_OK);
     assert(std::abs(parallel_state.velocity[0] - actual_joint_velocity[0]) < 1.0e-6);
     assert(std::abs(parallel_state.velocity[1] - actual_joint_velocity[1]) < 1.0e-6);
+    whole_body_diagnostics_v2 parallel_state_diagnostics{};
+    parallel_core.GetDiagnosticsV2(&parallel_state_diagnostics);
+    assert(parallel_state_diagnostics.coupling_count == 1);
+    assert(parallel_state_diagnostics.couplings[0].valid);
+    assert(parallel_state_diagnostics.couplings[0].jacobian_condition > 1.0);
+    assert(parallel_state_diagnostics.couplings[0].torque_amplification > 0.0);
 
     auto parallel_command = MakeCommand();
     parallel_command.kp[0] = 4.0;
@@ -543,6 +684,71 @@ int main() {
     mode_command.actuation_mode = static_cast<whole_body_actuation_mode>(-1);
     assert(mode_core.Write(mode_command, 1.07) == WHOLE_BODY_ERR_COMMAND);
     assert(mode_devices_ptr->last_commands[0].mode == MOTOR_MODE_IDLE);
+    {
+        auto failing_devices = std::make_unique<DummyDevices>();
+        failing_devices->write_failures = {"startup_motor errno=105"};
+        whole_body::WholeBodyCore failing_core(MakeConfig(false), std::move(failing_devices));
+        assert(failing_core.Init() == WHOLE_BODY_ERR_DEVICE);
+        assert(failing_core.LastError() ==
+            "failed to establish disabled startup state: startup_motor errno=105");
+    }
+    {
+        auto failing_devices = std::make_unique<DummyDevices>();
+        auto *failing_ptr = failing_devices.get();
+        whole_body::WholeBodyCore failing_core(MakeConfig(false), std::move(failing_devices));
+        assert(failing_core.Init() == WHOLE_BODY_OK);
+        failing_ptr->write_failures = {"command_motor errno=105", "disable_motor errno=100"};
+        assert(failing_core.Write(MakeCommand(), 1.0) == WHOLE_BODY_ERR_DEVICE);
+        assert(failing_core.LastError() == "failed to write motor commands: command_motor errno=105; "
+            "failed to disable motors: disable_motor errno=100");
+        assert(failing_ptr->write_count == 3);
+        assert(failing_ptr->last_commands[0].mode == MOTOR_MODE_IDLE);
+    }
+    {
+        auto failing_devices = std::make_unique<DummyDevices>();
+        auto *failing_ptr = failing_devices.get();
+        whole_body::WholeBodyCore failing_core(MakeConfig(false), std::move(failing_devices));
+        assert(failing_core.Init() == WHOLE_BODY_OK);
+        failing_ptr->write_failures = {"command_motor errno=105"};
+        assert(failing_core.Write(MakeCommand(), 1.0) == WHOLE_BODY_ERR_DEVICE);
+        assert(failing_core.LastError() == "failed to write motor commands: command_motor errno=105");
+        failing_ptr->write_failures.push_back("idle_motor errno=100");
+        assert(failing_core.Tick(2.0) == WHOLE_BODY_ERR_DEVICE);
+        assert(failing_core.LastError() ==
+            "failed to maintain disabled motor state: idle_motor errno=100");
+    }
+    {
+        auto failing_devices = std::make_unique<DummyDevices>();
+        auto *failing_ptr = failing_devices.get();
+        whole_body::WholeBodyCore failing_core(MakeConfig(false), std::move(failing_devices));
+        assert(failing_core.Init() == WHOLE_BODY_OK);
+        assert(failing_core.Write(MakeCommand(), 1.0) == WHOLE_BODY_OK);
+        failing_ptr->write_failures = {"watchdog_motor errno=105"};
+        assert(failing_core.Tick(2.0) == WHOLE_BODY_ERR_DEVICE);
+        assert(failing_core.LastError() == "watchdog failed to disable motors: watchdog_motor errno=105");
+    }
+    {
+        auto failing_devices = std::make_unique<DummyDevices>();
+        auto *failing_ptr = failing_devices.get();
+        whole_body::WholeBodyCore failing_core(MakeConfig(false), std::move(failing_devices));
+        assert(failing_core.Init() == WHOLE_BODY_OK);
+        failing_ptr->write_failures = {"mode_motor errno=105"};
+        assert(failing_core.SetMode(WHOLE_BODY_MODE_SAFETY) == WHOLE_BODY_ERR_DEVICE);
+        assert(failing_core.LastError() == "failed to enter a safe whole-body mode: mode_motor errno=105");
+    }
+    {
+        auto failing_devices = std::make_unique<DummyDevices>();
+        auto *failing_ptr = failing_devices.get();
+        whole_body::WholeBodyCore failing_core(MakeConfig(false), std::move(failing_devices));
+        assert(failing_core.Init() == WHOLE_BODY_OK);
+        failing_ptr->feedback[0].err = 1;
+        failing_ptr->write_failures = {"disable_motor errno=105"};
+        whole_body_state feedback{};
+        assert(failing_core.Read(&feedback) == WHOLE_BODY_ERR_DEVICE);
+        assert(failing_core.LastError().find("motor hardware error: motor_0") != std::string::npos);
+        assert(failing_core.LastError().find("; failed to disable motors: disable_motor errno=105") !=
+            std::string::npos);
+    }
     std::cout << "Whole-body core tests passed\n";
     return 0;
 }

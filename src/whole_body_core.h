@@ -34,8 +34,11 @@ class WholeBodyCore {
     int SetMode(whole_body_mode mode);
     whole_body_health GetHealth() const;
     void GetDiagnostics(whole_body_diagnostics *diagnostics) const;
+    void GetDiagnosticsV2(whole_body_diagnostics_v2 *diagnostics) const;
     void GetMotorCommandDiagnostics(
         whole_body_motor_command_diagnostics *diagnostics) const;
+    void GetMotorCommandDiagnosticsV2(
+        whole_body_motor_command_diagnostics_v2 *diagnostics) const;
     double CycleSeconds() const;
     const std::string &LastError() const;
 
@@ -44,6 +47,16 @@ class WholeBodyCore {
         ParallelAnkle mapping;
         std::array<size_t, 2> joint_indices;
         std::array<size_t, 2> motor_indices;
+        bool metrics_valid = false;
+        double jacobian_condition = 0.0;
+        double torque_amplification = 0.0;
+    };
+
+    struct MotorCommandMetrics {
+        double estimated_torque = 0.0;
+        double position_rate = 0.0;
+        double velocity_rate = 0.0;
+        double torque_rate = 0.0;
     };
 
     int Fail(int error, const std::string &message);
@@ -53,12 +66,19 @@ class WholeBodyCore {
         const whole_body_state &state, std::string *reason) const;
     int BuildMotorCommands(
         const whole_body_joint_command &command, std::vector<motor_cmd> *motor_commands);
+    bool ValidateMotorCommands(const std::vector<motor_cmd> &commands,
+        double monotonic_time_s, std::vector<MotorCommandMetrics> *metrics,
+        std::string *reason) const;
     int SendMotorCommands(
-        const std::vector<motor_cmd> &commands, double monotonic_time_s);
+        const std::vector<motor_cmd> &commands, double monotonic_time_s,
+        const std::vector<MotorCommandMetrics> *metrics = nullptr);
     int SendIdle();
     int EnterSafety(int error, const std::string &message);
     std::string DescribeFeedbackProblem(const std::string &prefix) const;
     std::string DescribeMotorErrors() const;
+    std::string DescribeWriteFailure(const std::string &prefix) const;
+    bool IsNonFatalMotorError(size_t index) const;
+    uint32_t FatalMotorError(size_t index) const;
 
     RuntimeConfig config_;
     std::unique_ptr<DeviceManager> devices_;
@@ -67,6 +87,7 @@ class WholeBodyCore {
     std::vector<CouplingRuntime> couplings_;
     std::vector<motor_state> motor_states_;
     std::vector<motor_cmd> last_motor_commands_;
+    std::vector<MotorCommandMetrics> last_motor_command_metrics_;
     std::vector<double> joint_position_;
     std::vector<double> joint_velocity_;
     std::vector<std::array<double, 2>> reference_position_limits_;

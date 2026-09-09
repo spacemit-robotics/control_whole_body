@@ -45,6 +45,9 @@ int main(int argc, char *argv[]) {
     assert(config.num_dof == 2);
     assert(config.joint_names[1] == "joint_1");
     assert(config.motors.size() == 2);
+    assert(config.motors[0].non_fatal_error_codes == std::vector<uint32_t>({0x04U}));
+    assert(config.motors[0].command_limits.kp_max == 500.0);
+    assert(config.motors[0].command_limits.estimated_torque_max == 90.0);
     assert(config.joints[0].impedance.mode == whole_body::ImpedanceMode::kSplit);
     assert(config.joints[0].impedance.motor_kp_max == 500.0);
     assert(config.joints[0].impedance.motor_kd_max == 5.0);
@@ -63,6 +66,7 @@ int main(int argc, char *argv[]) {
     assert(!config.read_only);
     assert(config.allow_actuation);
     assert(config.startup_feedback_timeout_s > config.feedback_timeout_s);
+    assert(config.require_motor_receive_timestamps);
     ValidatePublicCreate(data_dir + "/main.yaml");
 
     bool rejected_unknown_field = false;

@@ -51,6 +51,11 @@ int main() {
     assert(std::abs(jacobian[1] - 0.541666667) < 1.0e-6);
     assert(std::abs(jacobian[2] - 1.0) < 1.0e-6);
     assert(std::abs(jacobian[3] + 0.541666667) < 1.0e-6);
+    double condition = 0.0;
+    double torque_amplification = 0.0;
+    assert(mapping.Metrics({0.0, 0.0}, &condition, &torque_amplification));
+    assert(condition > 1.0);
+    assert(torque_amplification > 0.0);
 
     const std::array<double, 2> joint = {0.1, -0.1};
     assert(mapping.JointToMotor(joint, &motor));

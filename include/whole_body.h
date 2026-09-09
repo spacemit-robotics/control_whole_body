@@ -18,6 +18,7 @@ extern "C" {
 
 #define WHOLE_BODY_MAX_DOF 64
 #define WHOLE_BODY_MAX_MOTORS 128
+#define WHOLE_BODY_MAX_COUPLINGS (WHOLE_BODY_MAX_DOF / 2)
 #define WHOLE_BODY_NAME_LENGTH 64
 #define WHOLE_BODY_PATH_LENGTH 128
 #define WHOLE_BODY_JOINT_LABEL_LENGTH 128
@@ -58,6 +59,13 @@ enum whole_body_health_state {
     WHOLE_BODY_HEALTH_READ_ONLY = 2,
     WHOLE_BODY_HEALTH_WATCHDOG = 3,
     WHOLE_BODY_HEALTH_ERROR = 4,
+};
+
+/** @brief Origin of the timestamp used to evaluate motor-feedback freshness. */
+enum whole_body_feedback_timestamp_source {
+    WHOLE_BODY_FEEDBACK_TIMESTAMP_NONE = 0,
+    WHOLE_BODY_FEEDBACK_TIMESTAMP_READ_COMPLETION = 1,
+    WHOLE_BODY_FEEDBACK_TIMESTAMP_HARDWARE_RECEIVE = 2,
 };
 
 /**
@@ -169,6 +177,83 @@ struct whole_body_imu_diagnostic {
     double acceleration[3];
 };
 
+/** @brief Extended physical-motor feedback and safety diagnostics. */
+struct whole_body_motor_diagnostic_v2 {
+    char name[WHOLE_BODY_NAME_LENGTH];
+    char joint_names[WHOLE_BODY_JOINT_LABEL_LENGTH];
+    char driver[WHOLE_BODY_NAME_LENGTH];
+    char model[WHOLE_BODY_NAME_LENGTH];
+    char bus[WHOLE_BODY_NAME_LENGTH];
+    char device[WHOLE_BODY_PATH_LENGTH];
+    uint16_t command_id;
+    uint16_t feedback_id;
+    bool feedback_received;
+    bool feedback_fresh;
+    double feedback_age_s;
+    double feedback_timestamp_s;
+    enum whole_body_feedback_timestamp_source feedback_timestamp_source;
+    double raw_position;
+    double raw_velocity;
+    double raw_torque;
+    double calibrated_position;
+    double calibrated_velocity;
+    double calibrated_torque;
+    double temperature;
+    uint32_t error;
+    uint32_t warning_error;
+    uint32_t fatal_error;
+};
+
+/** @brief Extended mapped motor command and safety-envelope diagnostics. */
+struct whole_body_motor_command_diagnostic_v2 {
+    bool valid;
+    double age_s;
+    int32_t mode;
+    double position;
+    double velocity;
+    double torque;
+    double kp;
+    double kd;
+    double estimated_torque;
+    double position_rate;
+    double velocity_rate;
+    double torque_rate;
+};
+
+/** @brief Extended read-only physical-motor command snapshot. */
+struct whole_body_motor_command_diagnostics_v2 {
+    uint32_t motor_count;
+    struct whole_body_motor_command_diagnostic_v2 motors[WHOLE_BODY_MAX_MOTORS];
+};
+
+/** @brief Extended body-frame IMU timing and parser diagnostics. */
+struct whole_body_imu_diagnostic_v2 {
+    char driver[WHOLE_BODY_NAME_LENGTH];
+    char device[WHOLE_BODY_PATH_LENGTH];
+    bool feedback_received;
+    bool feedback_fresh;
+    double feedback_age_s;
+    double sample_timestamp_s;
+    double receive_timestamp_s;
+    double quaternion[4];
+    double gyro[3];
+    double acceleration[3];
+    uint64_t valid_frames;
+    uint64_t crc_errors;
+    uint64_t decode_errors;
+    uint64_t superseded_frames;
+    uint64_t resync_discarded_bytes;
+    uint64_t overflow_discarded_bytes;
+};
+
+/** @brief Numerical health of one coupled joint mapping at the latest state. */
+struct whole_body_coupling_diagnostic {
+    char joint_names[WHOLE_BODY_JOINT_LABEL_LENGTH];
+    bool valid;
+    double jacobian_condition;
+    double torque_amplification;
+};
+
 /** @brief Read-only diagnostic snapshot; it never changes actuation state. */
 struct whole_body_diagnostics {
     double timestamp_s;
@@ -177,6 +262,20 @@ struct whole_body_diagnostics {
     struct whole_body_motor_diagnostic motors[WHOLE_BODY_MAX_MOTORS];
     struct whole_body_joint_diagnostic joints[WHOLE_BODY_MAX_DOF];
     struct whole_body_imu_diagnostic imu;
+    struct whole_body_health health;
+};
+
+/** @brief Versioned extended diagnostics; legacy diagnostics keep their original ABI. */
+struct whole_body_diagnostics_v2 {
+    double timestamp_s;
+    double feedback_window_s;
+    uint32_t motor_count;
+    uint32_t joint_count;
+    uint32_t coupling_count;
+    struct whole_body_motor_diagnostic_v2 motors[WHOLE_BODY_MAX_MOTORS];
+    struct whole_body_joint_diagnostic joints[WHOLE_BODY_MAX_DOF];
+    struct whole_body_imu_diagnostic_v2 imu;
+    struct whole_body_coupling_diagnostic couplings[WHOLE_BODY_MAX_COUPLINGS];
     struct whole_body_health health;
 };
 
@@ -193,6 +292,10 @@ int whole_body_get_diagnostics(
     const struct whole_body_dev *dev, struct whole_body_diagnostics *diagnostics);
 int whole_body_get_motor_command_diagnostics(const struct whole_body_dev *dev,
     struct whole_body_motor_command_diagnostics *diagnostics);
+int whole_body_get_diagnostics_v2(
+    const struct whole_body_dev *dev, struct whole_body_diagnostics_v2 *diagnostics);
+int whole_body_get_motor_command_diagnostics_v2(const struct whole_body_dev *dev,
+    struct whole_body_motor_command_diagnostics_v2 *diagnostics);
 int whole_body_get_cycle_s(const struct whole_body_dev *dev, double *cycle_s);
 const char *whole_body_last_error(const struct whole_body_dev *dev);
 void whole_body_destroy(struct whole_body_dev *dev);

@@ -91,6 +91,20 @@ int whole_body_get_motor_command_diagnostics(const struct whole_body_dev *dev,
     return WHOLE_BODY_OK;
 }
 
+int whole_body_get_diagnostics_v2(
+    const struct whole_body_dev *dev, struct whole_body_diagnostics_v2 *diagnostics) {
+    if (!dev || !dev->core || !diagnostics) return WHOLE_BODY_ERR_STATE;
+    dev->core->GetDiagnosticsV2(diagnostics);
+    return WHOLE_BODY_OK;
+}
+
+int whole_body_get_motor_command_diagnostics_v2(const struct whole_body_dev *dev,
+    struct whole_body_motor_command_diagnostics_v2 *diagnostics) {
+    if (!dev || !dev->core || !diagnostics) return WHOLE_BODY_ERR_STATE;
+    dev->core->GetMotorCommandDiagnosticsV2(diagnostics);
+    return WHOLE_BODY_OK;
+}
+
 int whole_body_get_cycle_s(const struct whole_body_dev *dev, double *cycle_s) {
     if (!dev || !dev->core || !cycle_s) return WHOLE_BODY_ERR_STATE;
     *cycle_s = dev->core->CycleSeconds();

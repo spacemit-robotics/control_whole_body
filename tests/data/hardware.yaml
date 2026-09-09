@@ -3,6 +3,7 @@ whole_body:
   startup_feedback_timeout_s: 1.0
   feedback_timeout_s: 0.04
   command_timeout_s: 0.1
+  require_motor_receive_timestamps: true
   startup_mode: disabled
   allow_actuation: true
   buses:
@@ -16,6 +17,14 @@ whole_body:
       feedback_id: 1
       polarity: 1
       zero_offset: 0.0
+      non_fatal_error_codes: [0x04]
+      command_limits:
+        kp_max: 500.0
+        kd_max: 5.0
+        estimated_torque_max: 90.0
+        position_rate_max: 0.0
+        velocity_rate_max: 0.0
+        torque_rate_max: 0.0
       driver_options: &encos_options
         enable_on_init: false
         protocol_limits:
