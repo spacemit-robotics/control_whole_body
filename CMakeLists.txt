@@ -9,8 +9,8 @@ set(CMAKE_POSITION_INDEPENDENT_CODE ON)
 
 find_package(Threads REQUIRED)
 find_package(yaml-cpp REQUIRED)
-find_library(MOTOR_LIBRARY NAMES motor
-    PATHS ${CMAKE_INSTALL_PREFIX}/lib NO_DEFAULT_PATH)
+find_package(motor CONFIG QUIET
+    PATHS ${CMAKE_INSTALL_PREFIX}/lib/cmake/motor NO_DEFAULT_PATH)
 find_path(MOTOR_INCLUDE_DIR NAMES motor.h
     PATHS ${CMAKE_INSTALL_PREFIX}/include NO_DEFAULT_PATH)
 find_library(IMU_LIBRARY NAMES imu
@@ -18,7 +18,7 @@ find_library(IMU_LIBRARY NAMES imu
 find_path(IMU_INCLUDE_DIR NAMES imu.h
     PATHS ${CMAKE_INSTALL_PREFIX}/include NO_DEFAULT_PATH)
 
-if(NOT MOTOR_LIBRARY OR NOT MOTOR_INCLUDE_DIR)
+if(NOT TARGET components::motor OR NOT MOTOR_INCLUDE_DIR)
     message(FATAL_ERROR "whole_body requires the installed motor component")
 endif()
 if(NOT IMU_LIBRARY OR NOT IMU_INCLUDE_DIR)
@@ -48,7 +48,7 @@ target_link_libraries(whole_body
         yaml-cpp
         ${IMU_LIBRARY}
         -Wl,--whole-archive
-        ${MOTOR_LIBRARY}
+        components::motor
         -Wl,--no-whole-archive
         Threads::Threads
         dl
