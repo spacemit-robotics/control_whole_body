@@ -160,13 +160,16 @@ whole_body:
 硬件配置包含：
 
 - `buses`：总线名称、类型、设备和速率。
-- `motors`：驱动、型号、总线、CAN ID、极性、零位、错误分类、命令包络和
+- `motors`：驱动、型号、总线、CAN ID、极性、零位、可选位置周期、错误分类、命令包络和
   `driver_options`。
 - `joints`：关节映射、位置/速度/力矩限制和阻抗模式。
 - `couplings`：并联机构的几何参数和数值求解限制。
 - `imu`：驱动、设备、波特率、安装矩阵和零偏。
 
 `joints` 的数量及顺序必须与 `robot_base.joint_names` 完全一致。
+当电机位置的等价分支相差固定周期时，可在对应电机配置 `position_period`。组件以
+`zero_offset` 为首次反馈的分支参考，并在反馈跨周期时保持关节坐标连续；反馈换算和
+位置命令反算使用同一运行期分支。未配置时保持原始多圈坐标语义。
 `driver_options` 由组件展开为键值项后交给具体外设驱动解析，`whole_body`
 不识别驱动私有协议。完整格式可参考 `tests/data/main.yaml` 和
 `tests/data/hardware.yaml`。

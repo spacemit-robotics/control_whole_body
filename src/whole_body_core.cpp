@@ -170,6 +170,9 @@ WholeBodyCore::WholeBodyCore(RuntimeConfig config, std::unique_ptr<DeviceManager
         }
     }
     motor_states_.resize(config_.motors.size());
+    motor_position_branch_offsets_.resize(config_.motors.size());
+    previous_motor_raw_positions_.resize(config_.motors.size());
+    motor_position_branch_initialized_.resize(config_.motors.size());
     last_motor_commands_.resize(config_.motors.size());
     last_motor_command_metrics_.resize(config_.motors.size());
     joint_position_.resize(config_.joints.size());
@@ -192,6 +195,12 @@ int WholeBodyCore::Init() {
     if (initialized_) return WHOLE_BODY_OK;
     if (devices_->Init() < 0)
         return Fail(WHOLE_BODY_ERR_DEVICE, "failed to initialize motor or IMU devices");
+    std::fill(motor_position_branch_offsets_.begin(),
+        motor_position_branch_offsets_.end(), 0.0);
+    std::fill(previous_motor_raw_positions_.begin(),
+        previous_motor_raw_positions_.end(), 0.0);
+    std::fill(motor_position_branch_initialized_.begin(),
+        motor_position_branch_initialized_.end(), false);
     initialized_ = true;
     if (!config_.read_only && config_.allow_actuation && SendIdle() != WHOLE_BODY_OK) {
         const std::string message = DescribeWriteFailure("failed to establish disabled startup state");
@@ -207,6 +216,41 @@ int WholeBodyCore::Init() {
     health_.state = config_.read_only ? WHOLE_BODY_HEALTH_READ_ONLY : WHOLE_BODY_HEALTH_READY;
     last_error_.clear();
     return WHOLE_BODY_OK;
+}
+
+void WholeBodyCore::UpdateMotorPositionBranches() {
+    for (size_t i = 0; i < config_.motors.size(); ++i) {
+        const auto &motor = config_.motors[i];
+        if (motor.position_period <= 0.0) continue;
+
+        const double raw_position = motor_states_[i].pos;
+        double new_offset = motor_position_branch_offsets_[i];
+        if (!motor_position_branch_initialized_[i]) {
+            new_offset = std::round(
+                (raw_position - motor.zero_offset) / motor.position_period) *
+                motor.position_period;
+            motor_position_branch_initialized_[i] = true;
+        } else {
+            const double raw_delta = raw_position - previous_motor_raw_positions_[i];
+            if (std::abs(raw_delta) > motor.position_period * 0.5) {
+                new_offset += std::round(raw_delta / motor.position_period) *
+                    motor.position_period;
+            }
+        }
+        previous_motor_raw_positions_[i] = raw_position;
+
+        const double offset_delta = new_offset - motor_position_branch_offsets_[i];
+        if (offset_delta != 0.0 && has_motor_command_ &&
+            MotorModeUsesPosition(last_motor_commands_[i].mode)) {
+            last_motor_commands_[i].pos_des += static_cast<float>(offset_delta);
+        }
+        motor_position_branch_offsets_[i] = new_offset;
+    }
+}
+
+double WholeBodyCore::NormalizedMotorPosition(size_t index) const {
+    return static_cast<double>(motor_states_[index].pos) -
+        motor_position_branch_offsets_[index];
 }
 
 int WholeBodyCore::Read(whole_body_state *state) {
@@ -237,6 +281,7 @@ int WholeBodyCore::Read(whole_body_state *state) {
         if (FatalMotorError(i) != 0)
             return EnterSafety(WHOLE_BODY_ERR_DEVICE, DescribeMotorErrors());
     }
+    UpdateMotorPositionBranches();
 
     std::memset(state, 0, sizeof(*state));
     state->num_dof = config_.num_dof;
@@ -247,7 +292,7 @@ int WholeBodyCore::Read(whole_body_state *state) {
     for (size_t i = 0; i < config_.motors.size(); ++i) {
         const auto &motor = config_.motors[i];
         motor_position[i] =
-            motor.polarity * (static_cast<double>(motor_states_[i].pos) - motor.zero_offset);
+            motor.polarity * (NormalizedMotorPosition(i) - motor.zero_offset);
         motor_velocity[i] = motor.polarity * motor_states_[i].vel;
         motor_torque[i] = motor.polarity * motor_states_[i].trq;
     }
@@ -445,6 +490,12 @@ int WholeBodyCore::BuildMotorCommands(
         for (auto &motor_command : *motor_commands) motor_command.mode = MOTOR_MODE_IDLE;
         return WHOLE_BODY_OK;
     }
+    for (size_t i = 0; i < config_.motors.size(); ++i) {
+        if (config_.motors[i].position_period > 0.0 &&
+            !motor_position_branch_initialized_[i]) {
+            return WHOLE_BODY_ERR_STATE;
+        }
+    }
 
     std::vector<double> position(config_.motors.size());
     std::vector<double> velocity(config_.motors.size());
@@ -577,8 +628,9 @@ int WholeBodyCore::BuildMotorCommands(
         const bool damp_mode = command.mode == WHOLE_BODY_MODE_DAMP;
         const bool hardware_damp = damp_mode && !software_controlled[i];
         output.mode = damp_mode ? MOTOR_MODE_HYBRID : actuation_mode[i];
-        const double mapped_position =
+        const double canonical_position =
             hardware_damp ? motor.zero_offset : motor.polarity * position[i] + motor.zero_offset;
+        const double mapped_position = canonical_position + motor_position_branch_offsets_[i];
         const double mapped_velocity = hardware_damp ? 0.0 : motor.polarity * velocity[i];
         const double mapped_torque = hardware_damp ? 0.0 : motor.polarity * torque[i];
         const double mapped_kp = damp_mode ? 0.0 : kp[i];
@@ -1007,7 +1059,7 @@ void WholeBodyCore::GetDiagnosticsV2(whole_body_diagnostics_v2 *diagnostics) con
             output.raw_velocity = motor_states_[i].vel;
             output.raw_torque = motor_states_[i].trq;
             output.calibrated_position =
-                config.polarity * (motor_states_[i].pos - config.zero_offset);
+                config.polarity * (NormalizedMotorPosition(i) - config.zero_offset);
             output.calibrated_velocity = config.polarity * motor_states_[i].vel;
             output.calibrated_torque = config.polarity * motor_states_[i].trq;
             output.temperature = motor_states_[i].temp;

@@ -7,6 +7,7 @@
  */
 
 #include <cassert>
+#include <cmath>
 #include <iostream>
 #include <stdexcept>
 #include <string>
@@ -45,6 +46,8 @@ int main(int argc, char *argv[]) {
     assert(config.num_dof == 2);
     assert(config.joint_names[1] == "joint_1");
     assert(config.motors.size() == 2);
+    assert(std::abs(config.motors[0].position_period - 6.283185307) < 1.0e-9);
+    assert(config.motors[1].position_period == 0.0);
     assert(config.motors[0].non_fatal_error_codes == std::vector<uint32_t>({0x04U}));
     assert(config.motors[0].command_limits.kp_max == 500.0);
     assert(config.motors[0].command_limits.estimated_torque_max == 90.0);

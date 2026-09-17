@@ -168,9 +168,56 @@ whole_body_joint_command MakeCommand() {
     return command;
 }
 
+void TestPeriodicMotorPosition() {
+    constexpr double kTwoPi = 6.283185307179586;
+    constexpr double kZeroOffset = -2.0586329;
+    constexpr double kRawPosition = 4.139200211;
+
+    auto config = MakeConfig(false);
+    config.motors[0].zero_offset = kZeroOffset;
+    config.motors[0].position_period = kTwoPi;
+    config.motors[0].command_limits.position_rate_max = 1.0;
+    config.joints[0].position_limit = {-0.2, 2.0};
+    auto devices = std::make_unique<DummyDevices>();
+    DummyDevices *devices_ptr = devices.get();
+    devices_ptr->feedback[0].pos = kRawPosition;
+    devices_ptr->feedback[1].pos = 0.3f;
+
+    whole_body::WholeBodyCore core(std::move(config), std::move(devices));
+    assert(core.Init() == WHOLE_BODY_OK);
+    whole_body_state state{};
+    assert(core.Read(&state) == WHOLE_BODY_OK);
+    const double expected_position =
+        -(kRawPosition - kTwoPi - kZeroOffset);
+    assert(std::abs(state.position[0] - expected_position) < 1.0e-6);
+
+    whole_body_diagnostics diagnostics{};
+    core.GetDiagnostics(&diagnostics);
+    assert(std::abs(diagnostics.motors[0].raw_position - kRawPosition) < 1.0e-6);
+    assert(std::abs(
+        diagnostics.motors[0].calibrated_position - expected_position) < 1.0e-6);
+
+    auto command = MakeCommand();
+    command.position[0] = 0.3;
+    assert(core.Write(command, 1.0) == WHOLE_BODY_OK);
+    const double expected_wrapped_command = -0.3 + kZeroOffset + kTwoPi;
+    assert(std::abs(
+        devices_ptr->last_commands[0].pos_des - expected_wrapped_command) < 1.0e-6);
+
+    devices_ptr->feedback[0].pos = static_cast<float>(kRawPosition - kTwoPi);
+    assert(core.Read(&state) == WHOLE_BODY_OK);
+    assert(std::abs(state.position[0] - expected_position) < 1.0e-6);
+    command.position[0] = 0.4;
+    assert(core.Write(command, 1.2) == WHOLE_BODY_OK);
+    const double expected_unwrapped_command = -0.4 + kZeroOffset;
+    assert(std::abs(
+        devices_ptr->last_commands[0].pos_des - expected_unwrapped_command) < 1.0e-6);
+}
+
 }  // namespace
 
 int main() {
+    TestPeriodicMotorPosition();
     auto devices = std::make_unique<DummyDevices>();
     DummyDevices *devices_ptr = devices.get();
     devices_ptr->feedback[0].pos = 1.1f;

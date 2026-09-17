@@ -17,6 +17,7 @@ whole_body:
       feedback_id: 1
       polarity: 1
       zero_offset: 0.0
+      position_period: 6.283185307
       non_fatal_error_codes: [0x04]
       command_limits:
         kp_max: 500.0
