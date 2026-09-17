@@ -162,6 +162,7 @@ void ValidateRotation(const std::array<float, 9> &rotation) {
 void ValidateReferences(const RuntimeConfig &config) {
     std::unordered_set<std::string> buses;
     std::unordered_set<std::string> motors;
+    std::unordered_map<std::string, const MotorConfig *> motor_configs;
     std::unordered_map<std::string, const JointConfig *> joints;
     std::unordered_set<std::string> coupled_joints;
     std::unordered_set<std::string> coupled_motors;
@@ -180,6 +181,7 @@ void ValidateReferences(const RuntimeConfig &config) {
     for (const auto &motor : config.motors) {
         if (!motors.insert(motor.name).second)
             throw std::runtime_error("duplicate motor name '" + motor.name + "'");
+        motor_configs.emplace(motor.name, &motor);
         if (buses.count(motor.bus) == 0)
             throw std::runtime_error("motor '" + motor.name + "' references unknown bus");
     }
@@ -205,6 +207,16 @@ void ValidateReferences(const RuntimeConfig &config) {
             throw std::runtime_error("direct joint '" + joint.name + "' requires one motor");
         if (joint.mapping == "direct" && !assigned_motors.insert(joint.motors[0]).second)
             throw std::runtime_error("motor '" + joint.motors[0] + "' is assigned more than once");
+        if (joint.mapping == "direct") {
+            const auto &motor = *motor_configs.at(joint.motors[0]);
+            const double half_period = motor.position_period * 0.5;
+            if (motor.position_period > 0.0 &&
+                (joint.position_limit[0] <= -half_period ||
+                    joint.position_limit[1] >= half_period)) {
+                throw std::runtime_error("periodic motor '" + motor.name +
+                    "' requires joint limits within half a position period");
+            }
+        }
         if (joint.mapping == "parallel_ankle" && joint.motors.size() != 2)
             throw std::runtime_error(
                 "parallel_ankle joint '" + joint.name + "' requires two motors");
@@ -233,6 +245,11 @@ void ValidateReferences(const RuntimeConfig &config) {
                 throw std::runtime_error("motor '" + motor + "' belongs to multiple couplings");
             if (!assigned_motors.insert(motor).second)
                 throw std::runtime_error("motor '" + motor + "' is assigned more than once");
+            const double period = motor_configs.at(motor)->position_period;
+            if (period > 0.0 && coupling.motor_limit >= period * 0.5) {
+                throw std::runtime_error("periodic motor '" + motor +
+                    "' requires coupling motor_limit below half a position period");
+            }
         }
         for (const auto &joint_name : coupling.joints) {
             const auto &joint_motors = joints.at(joint_name)->motors;
@@ -353,7 +370,8 @@ RuntimeConfig LoadConfig(const std::string &main_config_path) {
         const std::string path = "whole_body.motors[" + std::to_string(i) + "]";
         CheckKeys(motors[i],
             {"name", "driver", "bus", "model", "command_id", "feedback_id", "polarity",
-                "zero_offset", "non_fatal_error_codes", "command_limits", "driver_options"},
+                "zero_offset", "position_period", "non_fatal_error_codes", "command_limits",
+                "driver_options"},
             path);
         MotorConfig motor;
         motor.name = Required<std::string>(motors[i], "name", path);
@@ -364,6 +382,12 @@ RuntimeConfig LoadConfig(const std::string &main_config_path) {
         motor.feedback_id = Required<uint16_t>(motors[i], "feedback_id", path);
         motor.polarity = Required<double>(motors[i], "polarity", path);
         motor.zero_offset = Required<double>(motors[i], "zero_offset", path);
+        if (motors[i]["position_period"]) {
+            motor.position_period = Required<double>(motors[i], "position_period", path);
+            RequireFinite(motor.position_period, path + ".position_period");
+            if (motor.position_period <= 0.0)
+                throw std::runtime_error(path + ".position_period must be positive");
+        }
         if (motors[i]["non_fatal_error_codes"]) {
             motor.non_fatal_error_codes = Required<std::vector<uint32_t>>(
                 motors[i], "non_fatal_error_codes", path);

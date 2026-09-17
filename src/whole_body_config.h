@@ -46,6 +46,7 @@ struct MotorConfig {
     uint16_t feedback_id = 0;
     double polarity = 1.0;
     double zero_offset = 0.0;
+    double position_period = 0.0;
     std::vector<uint32_t> non_fatal_error_codes;
     MotorCommandLimits command_limits;
     std::vector<DriverOption> driver_options;

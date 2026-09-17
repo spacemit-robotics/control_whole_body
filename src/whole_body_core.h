@@ -79,6 +79,8 @@ class WholeBodyCore {
     std::string DescribeWriteFailure(const std::string &prefix) const;
     bool IsNonFatalMotorError(size_t index) const;
     uint32_t FatalMotorError(size_t index) const;
+    void UpdateMotorPositionBranches();
+    double NormalizedMotorPosition(size_t index) const;
 
     RuntimeConfig config_;
     std::unique_ptr<DeviceManager> devices_;
@@ -86,6 +88,9 @@ class WholeBodyCore {
     std::unordered_map<std::string, size_t> joint_indices_;
     std::vector<CouplingRuntime> couplings_;
     std::vector<motor_state> motor_states_;
+    std::vector<double> motor_position_branch_offsets_;
+    std::vector<double> previous_motor_raw_positions_;
+    std::vector<bool> motor_position_branch_initialized_;
     std::vector<motor_cmd> last_motor_commands_;
     std::vector<MotorCommandMetrics> last_motor_command_metrics_;
     std::vector<double> joint_position_;
