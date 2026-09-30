@@ -242,10 +242,14 @@ TORQUE 模式使用直接力矩目标；位置和速度模式无法从通用接�
 `startup_mode: read_only` 只读取反馈，拒绝执行器命令。
 `startup_mode: disabled` 在初始化后发送真实协议失能帧，并在 POWER_OFF 下持续
 维持失能；只有上层明确进入 DAMP、HOME、ZERO 或 RL 后才允许使能。
+初始化时必须取得晚于本次启动、且均未超过 `feedback_timeout_s` 的电机与 IMU 反馈；
+在 `startup_feedback_timeout_s` 内未收齐时保持初始化状态和失能，不接受运动命令。
+超出启动窗口才报反馈超时；一旦就绪，后续反馈中断立即按运行期
+`feedback_timeout_s` 处理。设备主动报告的故障与非法反馈不等待启动窗口。
 
 以下情况会触发安全处理：
 
-- 反馈未到达或超过 `feedback_timeout_s`。
+- 超过启动窗口仍未收齐新鲜反馈，或运行期反馈超过 `feedback_timeout_s`。
 - 控制命令超过 `command_timeout_s`。
 - 命令包含非有限值或超出配置限制。
 - 关节映射、外设读写或硬件状态异常。

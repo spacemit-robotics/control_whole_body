@@ -39,6 +39,12 @@ class DummyDevices final : public whole_body::DeviceManager {
         status->imu_received = read_result == whole_body::DEVICE_READ_OK;
         status->imu_fresh = read_result == whole_body::DEVICE_READ_OK;
         status->imu_age_s = 0.001;
+        if (read_result == whole_body::DEVICE_READ_WAITING && partial_feedback) {
+            (*motors)[0] = feedback[0];
+            status->motor_received[0] = partial_feedback_received;
+            status->motor_fresh[0] = partial_feedback_received && partial_feedback_fresh;
+            status->motor_age_s[0] = partial_feedback_fresh ? 0.001 : 0.05;
+        }
         if (read_result != whole_body::DEVICE_READ_OK) return read_result;
         *motors = feedback;
         std::memset(imu, 0, sizeof(*imu));
@@ -71,7 +77,74 @@ class DummyDevices final : public whole_body::DeviceManager {
     std::vector<std::string> write_failures;
     size_t next_write_failure = 0;
     bool initialized = false;
+    bool partial_feedback = false;
+    bool partial_feedback_received = true;
+    bool partial_feedback_fresh = true;
 };
+
+whole_body::RuntimeConfig MakeConfig(bool read_only);
+
+void TestStartupFeedbackGate() {
+    assert(!whole_body::ReceivedSinceStartup(false, 101.0, 100.0));
+    assert(!whole_body::ReceivedSinceStartup(true, 99.0, 100.0));
+    assert(!whole_body::ReceivedSinceStartup(true, 100.0, 100.0));
+    assert(whole_body::ReceivedSinceStartup(true, 100.001, 100.0));
+
+    whole_body::StartupFeedbackGate gate;
+    assert(gate.Update(false, 0.04, 1.5) == whole_body::DEVICE_READ_WAITING);
+    assert(gate.Update(false, 1.49, 1.5) == whole_body::DEVICE_READ_WAITING);
+    assert(gate.Update(true, 1.49, 1.5) == whole_body::DEVICE_READ_OK);
+    assert(gate.Update(false, 1.50, 1.5) == whole_body::DEVICE_READ_ERROR);
+
+    whole_body::StartupFeedbackGate missing;
+    assert(missing.Update(false, 1.50, 1.5) == whole_body::DEVICE_READ_WAITING);
+    assert(missing.Update(false, 1.51, 1.5) == whole_body::DEVICE_READ_ERROR);
+}
+
+void TestPartialStartupFaults() {
+    for (bool fresh : {true, false}) {
+        auto devices = std::make_unique<DummyDevices>();
+        auto *device = devices.get();
+        device->read_result = whole_body::DEVICE_READ_WAITING;
+        device->partial_feedback = true;
+        device->partial_feedback_fresh = fresh;
+        device->feedback[0].err = 1;
+        whole_body::WholeBodyCore core(MakeConfig(false), std::move(devices));
+        assert(core.Init() == WHOLE_BODY_OK);
+        whole_body_state state{};
+        assert(core.Read(&state) == WHOLE_BODY_ERR_DEVICE);
+        assert(core.LastError().find("motor_0") != std::string::npos);
+        assert(core.GetHealth().state == WHOLE_BODY_HEALTH_ERROR);
+    }
+    for (bool fresh : {true, false}) {
+        auto devices = std::make_unique<DummyDevices>();
+        auto *device = devices.get();
+        device->read_result = whole_body::DEVICE_READ_WAITING;
+        device->partial_feedback = true;
+        device->partial_feedback_fresh = fresh;
+        device->feedback[0].pos = NAN;
+        whole_body::WholeBodyCore core(MakeConfig(false), std::move(devices));
+        assert(core.Init() == WHOLE_BODY_OK);
+        whole_body_state state{};
+        assert(core.Read(&state) == WHOLE_BODY_ERR_STATE);
+        assert(core.LastError().find("non-finite") != std::string::npos);
+        assert(core.GetHealth().state == WHOLE_BODY_HEALTH_ERROR);
+    }
+    {
+        auto devices = std::make_unique<DummyDevices>();
+        auto *device = devices.get();
+        device->read_result = whole_body::DEVICE_READ_WAITING;
+        device->partial_feedback = true;
+        device->partial_feedback_received = false;
+        device->feedback[0].err = 1;
+        whole_body::WholeBodyCore core(MakeConfig(false), std::move(devices));
+        assert(core.Init() == WHOLE_BODY_OK);
+        whole_body_state state{};
+        assert(core.Read(&state) == WHOLE_BODY_ERR_STATE);
+        assert(core.GetHealth().state == WHOLE_BODY_HEALTH_CREATED);
+        assert(core.GetHealth().last_error == WHOLE_BODY_OK);
+    }
+}
 
 whole_body::RuntimeConfig MakeConfig(bool read_only) {
     whole_body::RuntimeConfig config;
@@ -217,6 +290,8 @@ void TestPeriodicMotorPosition() {
 }  // namespace
 
 int main() {
+    TestStartupFeedbackGate();
+    TestPartialStartupFaults();
     TestPeriodicMotorPosition();
     auto devices = std::make_unique<DummyDevices>();
     DummyDevices *devices_ptr = devices.get();
@@ -229,10 +304,15 @@ int main() {
     assert(core.Read(&state) == WHOLE_BODY_ERR_STATE);
     assert(core.LastError().find("motor_0") != std::string::npos);
     assert(core.LastError().find("imu") != std::string::npos);
+    assert(core.GetHealth().state == WHOLE_BODY_HEALTH_CREATED);
+    assert(core.GetHealth().last_error == WHOLE_BODY_OK);
     assert(devices_ptr->write_count == 1);
     assert(devices_ptr->last_commands[0].mode == MOTOR_MODE_IDLE);
+    assert(core.Write(MakeCommand(), 1.0) == WHOLE_BODY_ERR_STATE);
+    assert(devices_ptr->write_count == 1);
     devices_ptr->read_result = whole_body::DEVICE_READ_OK;
     assert(core.Read(&state) == WHOLE_BODY_OK);
+    assert(core.GetHealth().state == WHOLE_BODY_HEALTH_READY);
     assert(std::abs(state.position[0] + 1.0) < 1.0e-6);
     assert(std::abs(state.position[1] - 0.5) < 1.0e-6);
     whole_body_diagnostics diagnostics{};
@@ -432,6 +512,7 @@ int main() {
     assert(core.Write(command, 1.8) == WHOLE_BODY_ERR_COMMAND);
     assert(devices_ptr->write_count == 9);
     assert(core.SetMode(WHOLE_BODY_MODE_POWER_OFF) == WHOLE_BODY_OK);
+    assert(core.Read(&state) == WHOLE_BODY_OK);
 
     assert(core.Write(command, 1.9) == WHOLE_BODY_OK);
     assert(core.SetMode(WHOLE_BODY_MODE_SAFETY) == WHOLE_BODY_OK);
@@ -641,6 +722,8 @@ int main() {
     assert(mode_devices_ptr->write_count == 1);
     assert(mode_devices_ptr->last_commands[0].mode == MOTOR_MODE_IDLE);
     assert(mode_core.Tick(1.0) == WHOLE_BODY_OK);
+    whole_body_state mode_state{};
+    assert(mode_core.Read(&mode_state) == WHOLE_BODY_OK);
     assert(mode_devices_ptr->write_count == 2);
     auto mode_command = MakeCommand();
     mode_command.mode = WHOLE_BODY_MODE_HOME;
@@ -744,6 +827,8 @@ int main() {
         auto *failing_ptr = failing_devices.get();
         whole_body::WholeBodyCore failing_core(MakeConfig(false), std::move(failing_devices));
         assert(failing_core.Init() == WHOLE_BODY_OK);
+        whole_body_state feedback{};
+        assert(failing_core.Read(&feedback) == WHOLE_BODY_OK);
         failing_ptr->write_failures = {"command_motor errno=105", "disable_motor errno=100"};
         assert(failing_core.Write(MakeCommand(), 1.0) == WHOLE_BODY_ERR_DEVICE);
         assert(failing_core.LastError() == "failed to write motor commands: command_motor errno=105; "
@@ -756,6 +841,8 @@ int main() {
         auto *failing_ptr = failing_devices.get();
         whole_body::WholeBodyCore failing_core(MakeConfig(false), std::move(failing_devices));
         assert(failing_core.Init() == WHOLE_BODY_OK);
+        whole_body_state feedback{};
+        assert(failing_core.Read(&feedback) == WHOLE_BODY_OK);
         failing_ptr->write_failures = {"command_motor errno=105"};
         assert(failing_core.Write(MakeCommand(), 1.0) == WHOLE_BODY_ERR_DEVICE);
         assert(failing_core.LastError() == "failed to write motor commands: command_motor errno=105");
@@ -769,6 +856,8 @@ int main() {
         auto *failing_ptr = failing_devices.get();
         whole_body::WholeBodyCore failing_core(MakeConfig(false), std::move(failing_devices));
         assert(failing_core.Init() == WHOLE_BODY_OK);
+        whole_body_state feedback{};
+        assert(failing_core.Read(&feedback) == WHOLE_BODY_OK);
         assert(failing_core.Write(MakeCommand(), 1.0) == WHOLE_BODY_OK);
         failing_ptr->write_failures = {"watchdog_motor errno=105"};
         assert(failing_core.Tick(2.0) == WHOLE_BODY_ERR_DEVICE);

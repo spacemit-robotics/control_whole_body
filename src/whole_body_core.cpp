@@ -213,7 +213,7 @@ int WholeBodyCore::Init() {
     has_joint_state_ = false;
     last_idle_time_s_ = 0.0;
     health_.last_error = WHOLE_BODY_OK;
-    health_.state = config_.read_only ? WHOLE_BODY_HEALTH_READ_ONLY : WHOLE_BODY_HEALTH_READY;
+    health_.state = WHOLE_BODY_HEALTH_CREATED;
     last_error_.clear();
     return WHOLE_BODY_OK;
 }
@@ -258,10 +258,26 @@ int WholeBodyCore::Read(whole_body_state *state) {
         return Fail(WHOLE_BODY_ERR_STATE, "whole-body backend is not initialized");
     const int read_result =
         devices_->Read(&motor_states_, &imu_state_, &feedback_status_);
+    for (size_t i = 0; i < motor_states_.size(); ++i) {
+        if (i >= feedback_status_.motor_received.size() || !feedback_status_.motor_received[i])
+            continue;
+        if (!MotorFeedbackIsFinite(motor_states_[i]))
+            return EnterSafety(WHOLE_BODY_ERR_STATE,
+                "motor or IMU feedback contains non-finite data");
+        if (FatalMotorError(i) != 0)
+            return EnterSafety(WHOLE_BODY_ERR_DEVICE, DescribeMotorErrors());
+    }
+    if (feedback_status_.imu_received && !ImuFeedbackIsFinite(imu_state_))
+        return EnterSafety(WHOLE_BODY_ERR_STATE,
+            "motor or IMU feedback contains non-finite data");
     if (read_result == DEVICE_READ_WAITING) {
         has_joint_state_ = false;
-        return Fail(WHOLE_BODY_ERR_STATE,
-            DescribeFeedbackProblem("waiting for initial feedback"));
+        if (!fault_latched_) {
+            health_.last_error = WHOLE_BODY_OK;
+            health_.state = WHOLE_BODY_HEALTH_CREATED;
+            last_error_ = DescribeFeedbackProblem("waiting for initial feedback");
+        }
+        return WHOLE_BODY_ERR_STATE;
     }
     if (read_result == DEVICE_READ_INCOMPATIBLE) {
         return EnterSafety(WHOLE_BODY_ERR_CONFIG,
@@ -270,16 +286,6 @@ int WholeBodyCore::Read(whole_body_state *state) {
     if (read_result < 0) {
         return EnterSafety(WHOLE_BODY_ERR_TIMEOUT,
             DescribeFeedbackProblem("feedback timed out"));
-    }
-    if (std::any_of(motor_states_.begin(), motor_states_.end(),
-            [](const motor_state &motor) { return !MotorFeedbackIsFinite(motor); }) ||
-        !ImuFeedbackIsFinite(imu_state_)) {
-        return EnterSafety(
-            WHOLE_BODY_ERR_STATE, "motor or IMU feedback contains non-finite data");
-    }
-    for (size_t i = 0; i < motor_states_.size(); ++i) {
-        if (FatalMotorError(i) != 0)
-            return EnterSafety(WHOLE_BODY_ERR_DEVICE, DescribeMotorErrors());
     }
     UpdateMotorPositionBranches();
 
@@ -778,6 +784,10 @@ int WholeBodyCore::Write(const whole_body_joint_command &command, double monoton
     if (fault_was_latched && !accepts_latched_fault) {
         return health_.last_error != WHOLE_BODY_OK ? health_.last_error : WHOLE_BODY_ERR_STATE;
     }
+    if (command.enable && command.mode != WHOLE_BODY_MODE_POWER_OFF && !has_joint_state_) {
+        last_error_ = "motor commands require fresh initial feedback";
+        return WHOLE_BODY_ERR_STATE;
+    }
     if (command.enable && command.mode != WHOLE_BODY_MODE_POWER_OFF && has_joint_state_ &&
         !ValidateJointPositions(last_state_, &validation_error)) {
         return EnterSafety(
@@ -815,11 +825,13 @@ int WholeBodyCore::Write(const whole_body_joint_command &command, double monoton
         watchdog_active_ = false;
         fault_latched_ = false;
         health_.last_error = WHOLE_BODY_OK;
-        health_.state = WHOLE_BODY_HEALTH_READY;
+        health_.state = has_joint_state_
+            ? WHOLE_BODY_HEALTH_READY : WHOLE_BODY_HEALTH_CREATED;
         last_error_.clear();
     } else {
         health_.last_error = WHOLE_BODY_OK;
-        health_.state = WHOLE_BODY_HEALTH_READY;
+        health_.state = has_joint_state_
+            ? WHOLE_BODY_HEALTH_READY : WHOLE_BODY_HEALTH_CREATED;
         last_error_.clear();
     }
     return WHOLE_BODY_OK;
@@ -921,7 +933,8 @@ int WholeBodyCore::SetMode(whole_body_mode mode) {
         watchdog_active_ = false;
         fault_latched_ = false;
         health_.last_error = WHOLE_BODY_OK;
-        health_.state = WHOLE_BODY_HEALTH_READY;
+        health_.state = has_joint_state_
+            ? WHOLE_BODY_HEALTH_READY : WHOLE_BODY_HEALTH_CREATED;
         last_error_.clear();
     } else if (mode == WHOLE_BODY_MODE_SAFETY) {
         has_command_ = false;
@@ -983,6 +996,8 @@ std::string WholeBodyCore::DescribeMotorErrors() const {
     message << "motor hardware error";
     bool has_detail = false;
     for (size_t i = 0; i < motor_states_.size(); ++i) {
+        if (i >= feedback_status_.motor_received.size() || !feedback_status_.motor_received[i])
+            continue;
         const uint32_t fatal_error = FatalMotorError(i);
         if (fatal_error == 0) continue;
         const auto &motor = config_.motors[i];

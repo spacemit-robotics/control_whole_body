@@ -31,6 +31,25 @@ enum DeviceReadResult {
     DEVICE_READ_WAITING = 1,
 };
 
+inline bool ReceivedSinceStartup(bool valid, double receive_time_s, double start_time_s) {
+    return valid && receive_time_s > start_time_s;
+}
+
+class StartupFeedbackGate {
+public:
+    int Update(bool all_fresh, double elapsed_s, double startup_timeout_s) {
+        if (ready_) return all_fresh ? DEVICE_READ_OK : DEVICE_READ_ERROR;
+        if (all_fresh) {
+            ready_ = true;
+            return DEVICE_READ_OK;
+        }
+        return elapsed_s > startup_timeout_s ? DEVICE_READ_ERROR : DEVICE_READ_WAITING;
+    }
+
+private:
+    bool ready_ = false;
+};
+
 struct DeviceFeedbackStatus {
     std::vector<uint8_t> motor_received;
     std::vector<uint8_t> motor_fresh;
