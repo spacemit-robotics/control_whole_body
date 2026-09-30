@@ -85,10 +85,15 @@ class DummyDevices final : public whole_body::DeviceManager {
 whole_body::RuntimeConfig MakeConfig(bool read_only);
 
 void TestStartupFeedbackGate() {
-    assert(!whole_body::ReceivedSinceStartup(false, 101.0, 100.0));
-    assert(!whole_body::ReceivedSinceStartup(true, 99.0, 100.0));
-    assert(!whole_body::ReceivedSinceStartup(true, 100.0, 100.0));
-    assert(whole_body::ReceivedSinceStartup(true, 100.001, 100.0));
+    constexpr auto received = WHOLE_BODY_FEEDBACK_TIMESTAMP_HARDWARE_RECEIVE;
+    assert(!whole_body::ReceivedSinceStartup(false, 101.0, 100.0, received));
+    assert(!whole_body::ReceivedSinceStartup(true, 99.0, 100.0, received));
+    assert(!whole_body::ReceivedSinceStartup(true, 100.0, 100.0, received));
+    assert(whole_body::ReceivedSinceStartup(true, 100.001, 100.0, received));
+    assert(!whole_body::ReceivedSinceStartup(true, 100.001, 100.0,
+        WHOLE_BODY_FEEDBACK_TIMESTAMP_READ_COMPLETION));
+    assert(!whole_body::ReceivedSinceStartup(true, 100.001, 100.0,
+        WHOLE_BODY_FEEDBACK_TIMESTAMP_NONE));
 
     whole_body::StartupFeedbackGate gate;
     assert(gate.Update(false, 0.04, 1.5) == whole_body::DEVICE_READ_WAITING);
@@ -99,6 +104,16 @@ void TestStartupFeedbackGate() {
     whole_body::StartupFeedbackGate missing;
     assert(missing.Update(false, 1.50, 1.5) == whole_body::DEVICE_READ_WAITING);
     assert(missing.Update(false, 1.51, 1.5) == whole_body::DEVICE_READ_ERROR);
+    assert(missing.Update(false, 1.52, 1.5) == whole_body::DEVICE_READ_ERROR);
+    assert(missing.Update(true, 1.53, 1.5) == whole_body::DEVICE_READ_OK);
+    assert(missing.Update(false, 1.54, 1.5) == whole_body::DEVICE_READ_ERROR);
+
+    whole_body::StartupFeedbackGate late;
+    assert(late.Update(true, 1.51, 1.5) == whole_body::DEVICE_READ_ERROR);
+    assert(late.Update(true, 1.52, 1.5) == whole_body::DEVICE_READ_OK);
+
+    whole_body::StartupFeedbackGate deadline;
+    assert(deadline.Update(true, 1.50, 1.5) == whole_body::DEVICE_READ_OK);
 }
 
 void TestPartialStartupFaults() {
@@ -241,6 +256,31 @@ whole_body_joint_command MakeCommand() {
     return command;
 }
 
+void TestStartupTimeoutRecovery() {
+    for (bool initially_fresh : {false, true}) {
+        auto devices = std::make_unique<DummyDevices>();
+        auto *device = devices.get();
+        whole_body::StartupFeedbackGate gate;
+        whole_body::WholeBodyCore core(MakeConfig(false), std::move(devices));
+        assert(core.Init() == WHOLE_BODY_OK);
+        whole_body_state state{};
+        device->read_result = gate.Update(initially_fresh, 1.51, 1.5);
+        assert(core.Read(&state) == WHOLE_BODY_ERR_TIMEOUT);
+        assert(core.GetHealth().state == WHOLE_BODY_HEALTH_ERROR);
+        assert(device->last_commands[0].mode == MOTOR_MODE_IDLE);
+        assert(core.Write(MakeCommand(), 1.51) == WHOLE_BODY_ERR_TIMEOUT);
+
+        device->read_result = gate.Update(true, 1.52, 1.5);
+        assert(core.Read(&state) == WHOLE_BODY_OK);
+        assert(core.GetHealth().state == WHOLE_BODY_HEALTH_ERROR);
+        assert(core.GetHealth().last_error == WHOLE_BODY_ERR_TIMEOUT);
+        assert(core.Write(MakeCommand(), 1.52) == WHOLE_BODY_ERR_TIMEOUT);
+        assert(core.SetMode(WHOLE_BODY_MODE_POWER_OFF) == WHOLE_BODY_OK);
+        assert(core.GetHealth().state == WHOLE_BODY_HEALTH_READY);
+        assert(core.Write(MakeCommand(), 1.53) == WHOLE_BODY_OK);
+    }
+}
+
 void TestPeriodicMotorPosition() {
     constexpr double kTwoPi = 6.283185307179586;
     constexpr double kZeroOffset = -2.0586329;
@@ -291,6 +331,7 @@ void TestPeriodicMotorPosition() {
 
 int main() {
     TestStartupFeedbackGate();
+    TestStartupTimeoutRecovery();
     TestPartialStartupFaults();
     TestPeriodicMotorPosition();
     auto devices = std::make_unique<DummyDevices>();

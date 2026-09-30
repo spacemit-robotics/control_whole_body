@@ -133,8 +133,6 @@ public:
         if (imu_feedback_valid_ && status->imu_parser.receive_timestamp_us > 0) {
             imu_feedback_time_s_ =
                 static_cast<double>(status->imu_parser.receive_timestamp_us) * 1.0e-6;
-        } else if (received_imu) {
-            imu_feedback_time_s_ = MonotonicTime();
         }
 
         const double now = MonotonicTime();
@@ -144,7 +142,8 @@ public:
         double latest_timestamp_s = 0.0;
         for (size_t i = 0; i < motors_.size(); ++i) {
             status->motor_received[i] = ReceivedSinceStartup(motor_feedback_valid_[i],
-                motor_feedback_time_s_[i], feedback_start_time_s_);
+                motor_feedback_time_s_[i], feedback_start_time_s_,
+                motor_feedback_timestamp_source_[i]);
             status->motor_timestamp_s[i] = motor_feedback_time_s_[i];
             status->motor_timestamp_source[i] = motor_feedback_timestamp_source_[i];
             status->motor_age_s[i] = motor_feedback_valid_[i]
@@ -153,7 +152,7 @@ public:
             status->motor_fresh[i] = status->motor_received[i] &&
                 status->motor_age_s[i] <= config_.feedback_timeout_s;
             if (!status->motor_fresh[i]) all_fresh = false;
-            if (status->motor_received[i] && config_.require_motor_receive_timestamps &&
+            if (motor_feedback_valid_[i] && config_.require_motor_receive_timestamps &&
                 motor_feedback_timestamp_source_[i] !=
                     WHOLE_BODY_FEEDBACK_TIMESTAMP_HARDWARE_RECEIVE) {
                 incompatible_timestamp = true;
@@ -165,7 +164,8 @@ public:
             latest_timestamp_s = std::max(latest_timestamp_s, timestamp_s);
         }
         status->imu_received = ReceivedSinceStartup(imu_feedback_valid_,
-            imu_feedback_time_s_, feedback_start_time_s_);
+            imu_feedback_time_s_, feedback_start_time_s_,
+            WHOLE_BODY_FEEDBACK_TIMESTAMP_HARDWARE_RECEIVE);
         status->imu_sample_timestamp_s = imu_feedback_valid_
             ? static_cast<double>(imu->timestamp_us) * 1.0e-6
             : 0.0;

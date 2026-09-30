@@ -973,7 +973,10 @@ std::string WholeBodyCore::DescribeFeedbackProblem(const std::string &prefix) co
                 << ",cmd=0x" << std::hex << motor.command_id << ",fb=0x"
                 << motor.feedback_id << std::dec << ",age_ms=" << std::fixed
                 << std::setprecision(1) << age_s * 1000.0;
-        if (incompatible_timestamp) message << ",timestamp=read_completion";
+        if (timestamp_source == WHOLE_BODY_FEEDBACK_TIMESTAMP_READ_COMPLETION)
+            message << ",timestamp=read_completion";
+        else if (incompatible_timestamp)
+            message << ",timestamp=none";
         message << ")";
         has_detail = true;
     }
