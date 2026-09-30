@@ -84,6 +84,9 @@ public:
         if (imu_init(imu_, &imu_config) < 0) return -1;
         initialized_ = true;
         feedback_start_time_s_ = MonotonicTime();
+        startup_feedback_gate_ = {};
+        std::fill(motor_feedback_valid_.begin(), motor_feedback_valid_.end(), false);
+        imu_feedback_valid_ = false;
         return 0;
     }
 
@@ -130,44 +133,39 @@ public:
         if (imu_feedback_valid_ && status->imu_parser.receive_timestamp_us > 0) {
             imu_feedback_time_s_ =
                 static_cast<double>(status->imu_parser.receive_timestamp_us) * 1.0e-6;
-        } else if (received_imu) {
-            imu_feedback_time_s_ = MonotonicTime();
         }
 
         const double now = MonotonicTime();
-        bool waiting_for_first_sample = false;
-        bool feedback_timed_out = false;
+        bool all_fresh = true;
         bool incompatible_timestamp = false;
         double earliest_timestamp_s = 0.0;
         double latest_timestamp_s = 0.0;
         for (size_t i = 0; i < motors_.size(); ++i) {
-            status->motor_received[i] = motor_feedback_valid_[i];
+            status->motor_received[i] = ReceivedSinceStartup(motor_feedback_valid_[i],
+                motor_feedback_time_s_[i], feedback_start_time_s_,
+                motor_feedback_timestamp_source_[i]);
             status->motor_timestamp_s[i] = motor_feedback_time_s_[i];
             status->motor_timestamp_source[i] = motor_feedback_timestamp_source_[i];
             status->motor_age_s[i] = motor_feedback_valid_[i]
                 ? std::max(0.0, now - motor_feedback_time_s_[i])
                 : now - feedback_start_time_s_;
-            status->motor_fresh[i] = motor_feedback_valid_[i] &&
+            status->motor_fresh[i] = status->motor_received[i] &&
                 status->motor_age_s[i] <= config_.feedback_timeout_s;
-            if (!motor_feedback_valid_[i]) {
-                if (status->motor_age_s[i] > config_.startup_feedback_timeout_s)
-                    feedback_timed_out = true;
-                else
-                    waiting_for_first_sample = true;
-                continue;
-            }
-            if (!status->motor_fresh[i]) feedback_timed_out = true;
-            if (config_.require_motor_receive_timestamps &&
+            if (!status->motor_fresh[i]) all_fresh = false;
+            if (motor_feedback_valid_[i] && config_.require_motor_receive_timestamps &&
                 motor_feedback_timestamp_source_[i] !=
                     WHOLE_BODY_FEEDBACK_TIMESTAMP_HARDWARE_RECEIVE) {
                 incompatible_timestamp = true;
             }
+            if (!status->motor_fresh[i]) continue;
             const double timestamp_s = motor_feedback_time_s_[i];
             if (earliest_timestamp_s == 0.0 || timestamp_s < earliest_timestamp_s)
                 earliest_timestamp_s = timestamp_s;
             latest_timestamp_s = std::max(latest_timestamp_s, timestamp_s);
         }
-        status->imu_received = imu_feedback_valid_;
+        status->imu_received = ReceivedSinceStartup(imu_feedback_valid_,
+            imu_feedback_time_s_, feedback_start_time_s_,
+            WHOLE_BODY_FEEDBACK_TIMESTAMP_HARDWARE_RECEIVE);
         status->imu_sample_timestamp_s = imu_feedback_valid_
             ? static_cast<double>(imu->timestamp_us) * 1.0e-6
             : 0.0;
@@ -175,15 +173,10 @@ public:
         status->imu_age_s = imu_feedback_valid_
             ? std::max(0.0, now - imu_feedback_time_s_)
             : now - feedback_start_time_s_;
-        status->imu_fresh = imu_feedback_valid_ &&
+        status->imu_fresh = status->imu_received &&
             status->imu_age_s <= config_.feedback_timeout_s;
-        if (!imu_feedback_valid_) {
-            if (status->imu_age_s > config_.startup_feedback_timeout_s)
-                feedback_timed_out = true;
-            else
-                waiting_for_first_sample = true;
-        } else if (!status->imu_fresh) {
-            feedback_timed_out = true;
+        if (!status->imu_fresh) {
+            all_fresh = false;
         } else {
             if (earliest_timestamp_s == 0.0 || imu_feedback_time_s_ < earliest_timestamp_s)
                 earliest_timestamp_s = imu_feedback_time_s_;
@@ -193,8 +186,8 @@ public:
             ? latest_timestamp_s - earliest_timestamp_s
             : 0.0;
         if (incompatible_timestamp) return DEVICE_READ_INCOMPATIBLE;
-        if (feedback_timed_out) return DEVICE_READ_ERROR;
-        return waiting_for_first_sample ? DEVICE_READ_WAITING : DEVICE_READ_OK;
+        return startup_feedback_gate_.Update(all_fresh,
+            now - feedback_start_time_s_, config_.startup_feedback_timeout_s);
     }
 
     int Write(const std::vector<motor_cmd> &commands) override {
@@ -246,6 +239,7 @@ private:
     double feedback_start_time_s_ = 0.0;
     double imu_feedback_time_s_ = 0.0;
     bool imu_feedback_valid_ = false;
+    StartupFeedbackGate startup_feedback_gate_;
     bool initialized_ = false;
     bool wrote_command_ = false;
 };

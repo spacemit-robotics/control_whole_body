@@ -242,10 +242,16 @@ TORQUE 模式使用直接力矩目标；位置和速度模式无法从通用接�
 `startup_mode: read_only` 只读取反馈，拒绝执行器命令。
 `startup_mode: disabled` 在初始化后发送真实协议失能帧，并在 POWER_OFF 下持续
 维持失能；只有上层明确进入 DAMP、HOME、ZERO 或 RL 后才允许使能。
+初始化时必须取得晚于本次启动、且均未超过 `feedback_timeout_s` 的电机与 IMU 反馈；
+在 `startup_feedback_timeout_s` 内未收齐时保持初始化状态和失能，不接受运动命令。
+超出启动窗口才报反馈超时；一旦就绪，后续反馈中断立即按运行期
+`feedback_timeout_s` 处理。设备主动报告的故障与非法反馈不等待启动窗口。
+首次收齐反馈已超出启动窗口时，也先报告超时；后续新鲜反馈允许恢复读取，
+但不会自动清除 SAFETY 锁存。
 
 以下情况会触发安全处理：
 
-- 反馈未到达或超过 `feedback_timeout_s`。
+- 超过启动窗口仍未收齐新鲜反馈，或运行期反馈超过 `feedback_timeout_s`。
 - 控制命令超过 `command_timeout_s`。
 - 命令包含非有限值或超出配置限制。
 - 关节映射、外设读写或硬件状态异常。
@@ -265,9 +271,11 @@ SAFETY 锁存后，仅切换到 POWER_OFF 才能清除。这是 `whole_body` 进
 `whole_body_get_motor_command_diagnostics_v2()` 提供映射/限幅后、协议编码前的最近一次
 电机命令及其估算力矩和变化率。两个接口都不会发送控制命令。
 电机驱动提供真实硬件接收时间时，诊断来源为 `HARDWARE_RECEIVE`，可准确检测缓存状态
-是否过期。旧驱动未提供该时间时，组件保留兼容路径并使用成功读取 API 的完成时间，来源
-明确标为 `READ_COMPLETION`。硬件机型可配置 `require_motor_receive_timestamps: true` 拒绝
-兼容时间，避免通信中断后把重复读取的缓存值误判为新反馈。
+是否过期。旧驱动未提供该时间时，诊断仍保留成功读取 API 的完成时间，来源明确标为
+`READ_COMPLETION`，但该时间不证明设备收到了新反馈，不能用于启动就绪或反馈保鲜判断。
+配置 `require_motor_receive_timestamps: true` 时，缺少电机接收时间立即报配置错误；
+否则保持等待，并在启动窗口截止后报反馈超时。IMU 同样只使用组件提供的主机接收时间，
+不以读取 API 的完成时间替代。
 
 ## 常见问题
 
