@@ -97,6 +97,7 @@ struct ParallelAnkleConfig {
 };
 
 struct ImuConfig {
+    bool enabled = true;
     std::string driver;
     std::string device;
     uint32_t baud = 0;

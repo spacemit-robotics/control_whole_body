@@ -31,7 +31,7 @@ double MonotonicTime() {
 }
 
 bool IsValidMode(whole_body_mode mode) {
-    return mode >= WHOLE_BODY_MODE_POWER_OFF && mode <= WHOLE_BODY_MODE_HOME;
+    return mode >= WHOLE_BODY_MODE_POWER_OFF && mode <= WHOLE_BODY_MODE_TRAJECTORY;
 }
 
 bool IsValidActuationMode(whole_body_actuation_mode mode) {
@@ -267,7 +267,7 @@ int WholeBodyCore::Read(whole_body_state *state) {
         if (FatalMotorError(i) != 0)
             return EnterSafety(WHOLE_BODY_ERR_DEVICE, DescribeMotorErrors());
     }
-    if (feedback_status_.imu_received && !ImuFeedbackIsFinite(imu_state_))
+    if (config_.imu.enabled && feedback_status_.imu_received && !ImuFeedbackIsFinite(imu_state_))
         return EnterSafety(WHOLE_BODY_ERR_STATE,
             "motor or IMU feedback contains non-finite data");
     if (read_result == DEVICE_READ_WAITING) {
@@ -291,7 +291,8 @@ int WholeBodyCore::Read(whole_body_state *state) {
 
     std::memset(state, 0, sizeof(*state));
     state->num_dof = config_.num_dof;
-    state->timestamp_s = static_cast<double>(imu_state_.timestamp_us) * 1.0e-6;
+    state->timestamp_s = config_.imu.enabled
+        ? static_cast<double>(imu_state_.timestamp_us) * 1.0e-6 : MonotonicTime();
     std::vector<double> motor_position(config_.motors.size());
     std::vector<double> motor_velocity(config_.motors.size());
     std::vector<double> motor_torque(config_.motors.size());
@@ -372,10 +373,13 @@ int WholeBodyCore::Read(whole_body_state *state) {
             return EnterSafety(WHOLE_BODY_ERR_STATE, reason);
     }
 
-    for (size_t i = 0; i < 4; ++i) state->base_quat[i] = imu_state_.quat[i];
-    for (size_t i = 0; i < 3; ++i) {
-        state->gyro[i] = imu_state_.gyro[i];
-        state->acceleration[i] = imu_state_.acc[i];
+    state->base_quat[0] = 1.0;
+    if (config_.imu.enabled) {
+        for (size_t i = 0; i < 4; ++i) state->base_quat[i] = imu_state_.quat[i];
+        for (size_t i = 0; i < 3; ++i) {
+            state->gyro[i] = imu_state_.gyro[i];
+            state->acceleration[i] = imu_state_.acc[i];
+        }
     }
     for (size_t i = 0; i < config_.joints.size(); ++i) {
         joint_position_[i] = state->position[i];
@@ -980,7 +984,7 @@ std::string WholeBodyCore::DescribeFeedbackProblem(const std::string &prefix) co
         message << ")";
         has_detail = true;
     }
-    if (!feedback_status_.imu_received || !feedback_status_.imu_fresh) {
+    if (config_.imu.enabled && (!feedback_status_.imu_received || !feedback_status_.imu_fresh)) {
         message << (has_detail ? ", " : ": ") << "imu(" << config_.imu.driver << ","
                 << config_.imu.device << ",age_ms=" << std::fixed << std::setprecision(1)
                 << feedback_status_.imu_age_s * 1000.0 << ")";
@@ -1026,6 +1030,8 @@ bool WholeBodyCore::IsNonFatalMotorError(size_t index) const {
 }
 
 whole_body_health WholeBodyCore::GetHealth() const { return health_; }
+
+bool WholeBodyCore::HasImu() const { return config_.imu.enabled; }
 
 void WholeBodyCore::GetDiagnosticsV2(whole_body_diagnostics_v2 *diagnostics) const {
     if (!diagnostics) return;
@@ -1099,26 +1105,28 @@ void WholeBodyCore::GetDiagnosticsV2(whole_body_diagnostics_v2 *diagnostics) con
         output.motor_error = last_state_.motor_error[i];
     }
 
-    CopyText(config_.imu.driver, diagnostics->imu.driver, sizeof(diagnostics->imu.driver));
-    CopyText(config_.imu.device, diagnostics->imu.device, sizeof(diagnostics->imu.device));
-    diagnostics->imu.feedback_received = feedback_status_.imu_received;
-    diagnostics->imu.feedback_fresh = feedback_status_.imu_fresh;
-    diagnostics->imu.feedback_age_s = feedback_status_.imu_age_s;
-    diagnostics->imu.sample_timestamp_s = feedback_status_.imu_sample_timestamp_s;
-    diagnostics->imu.receive_timestamp_s = feedback_status_.imu_receive_timestamp_s;
-    diagnostics->imu.valid_frames = feedback_status_.imu_parser.valid_frames;
-    diagnostics->imu.crc_errors = feedback_status_.imu_parser.crc_errors;
-    diagnostics->imu.decode_errors = feedback_status_.imu_parser.decode_errors;
-    diagnostics->imu.superseded_frames = feedback_status_.imu_parser.superseded_frames;
-    diagnostics->imu.resync_discarded_bytes =
-        feedback_status_.imu_parser.resync_discarded_bytes;
-    diagnostics->imu.overflow_discarded_bytes =
-        feedback_status_.imu_parser.overflow_discarded_bytes;
-    if (feedback_status_.imu_received) {
-        for (size_t i = 0; i < 4; ++i) diagnostics->imu.quaternion[i] = imu_state_.quat[i];
-        for (size_t i = 0; i < 3; ++i) {
-            diagnostics->imu.gyro[i] = imu_state_.gyro[i];
-            diagnostics->imu.acceleration[i] = imu_state_.acc[i];
+    if (config_.imu.enabled) {
+        CopyText(config_.imu.driver, diagnostics->imu.driver, sizeof(diagnostics->imu.driver));
+        CopyText(config_.imu.device, diagnostics->imu.device, sizeof(diagnostics->imu.device));
+        diagnostics->imu.feedback_received = feedback_status_.imu_received;
+        diagnostics->imu.feedback_fresh = feedback_status_.imu_fresh;
+        diagnostics->imu.feedback_age_s = feedback_status_.imu_age_s;
+        diagnostics->imu.sample_timestamp_s = feedback_status_.imu_sample_timestamp_s;
+        diagnostics->imu.receive_timestamp_s = feedback_status_.imu_receive_timestamp_s;
+        diagnostics->imu.valid_frames = feedback_status_.imu_parser.valid_frames;
+        diagnostics->imu.crc_errors = feedback_status_.imu_parser.crc_errors;
+        diagnostics->imu.decode_errors = feedback_status_.imu_parser.decode_errors;
+        diagnostics->imu.superseded_frames = feedback_status_.imu_parser.superseded_frames;
+        diagnostics->imu.resync_discarded_bytes =
+            feedback_status_.imu_parser.resync_discarded_bytes;
+        diagnostics->imu.overflow_discarded_bytes =
+            feedback_status_.imu_parser.overflow_discarded_bytes;
+        if (feedback_status_.imu_received) {
+            for (size_t i = 0; i < 4; ++i) diagnostics->imu.quaternion[i] = imu_state_.quat[i];
+            for (size_t i = 0; i < 3; ++i) {
+                diagnostics->imu.gyro[i] = imu_state_.gyro[i];
+                diagnostics->imu.acceleration[i] = imu_state_.acc[i];
+            }
         }
     }
     for (size_t i = 0; i < couplings_.size(); ++i) {

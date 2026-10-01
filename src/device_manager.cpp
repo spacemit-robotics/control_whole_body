@@ -59,12 +59,14 @@ public:
             motors_.push_back(device);
         }
 
-        const std::string imu_instance = config_.imu.driver + ":whole_body";
-        imu_ = imu_alloc_uart(
-            imu_instance.c_str(), config_.imu.device.c_str(), config_.imu.baud, nullptr);
-        if (!imu_) {
-            ReleaseAllocated();
-            throw std::runtime_error("failed to allocate IMU driver '" + config_.imu.driver + "'");
+        if (config_.imu.enabled) {
+            const std::string imu_instance = config_.imu.driver + ":whole_body";
+            imu_ = imu_alloc_uart(
+                imu_instance.c_str(), config_.imu.device.c_str(), config_.imu.baud, nullptr);
+            if (!imu_) {
+                ReleaseAllocated();
+                throw std::runtime_error("failed to allocate IMU driver '" + config_.imu.driver + "'");
+            }
         }
     }
 
@@ -73,15 +75,17 @@ public:
     int Init() override {
         if (initialized_) return 0;
         if (motor_init(motors_.data(), motors_.size()) < 0) return -1;
-        imu_config imu_config{};
-        std::copy(config_.imu.mounting_matrix.begin(), config_.imu.mounting_matrix.end(),
-            imu_config.mounting_matrix);
-        std::copy(config_.imu.acceleration_bias.begin(), config_.imu.acceleration_bias.end(),
-            imu_config.acc_offset);
-        std::copy(
-            config_.imu.gyro_bias.begin(), config_.imu.gyro_bias.end(), imu_config.gyro_offset);
-        imu_config.sample_rate = static_cast<uint32_t>(1.0 / config_.cycle_s);
-        if (imu_init(imu_, &imu_config) < 0) return -1;
+        if (config_.imu.enabled) {
+            imu_config imu_config{};
+            std::copy(config_.imu.mounting_matrix.begin(), config_.imu.mounting_matrix.end(),
+                imu_config.mounting_matrix);
+            std::copy(config_.imu.acceleration_bias.begin(), config_.imu.acceleration_bias.end(),
+                imu_config.acc_offset);
+            std::copy(
+                config_.imu.gyro_bias.begin(), config_.imu.gyro_bias.end(), imu_config.gyro_offset);
+            imu_config.sample_rate = static_cast<uint32_t>(1.0 / config_.cycle_s);
+            if (imu_init(imu_, &imu_config) < 0) return -1;
+        }
         initialized_ = true;
         feedback_start_time_s_ = MonotonicTime();
         startup_feedback_gate_ = {};
@@ -123,16 +127,21 @@ public:
             }
         }
 
-        imu_data current_imu{};
-        const bool received_imu = imu_read(imu_, &current_imu) == 0;
-        if (received_imu) {
-            *imu = current_imu;
-            imu_feedback_valid_ = true;
-        }
-        (void)imu_get_diagnostics(imu_, &status->imu_parser);
-        if (imu_feedback_valid_ && status->imu_parser.receive_timestamp_us > 0) {
-            imu_feedback_time_s_ =
-                static_cast<double>(status->imu_parser.receive_timestamp_us) * 1.0e-6;
+        if (config_.imu.enabled) {
+            imu_data current_imu{};
+            const bool received_imu = imu_read(imu_, &current_imu) == 0;
+            if (received_imu) {
+                *imu = current_imu;
+                imu_feedback_valid_ = true;
+            }
+            (void)imu_get_diagnostics(imu_, &status->imu_parser);
+            if (imu_feedback_valid_ && status->imu_parser.receive_timestamp_us > 0) {
+                imu_feedback_time_s_ =
+                    static_cast<double>(status->imu_parser.receive_timestamp_us) * 1.0e-6;
+            }
+        } else {
+            *imu = {};
+            status->imu_parser = {};
         }
 
         const double now = MonotonicTime();
@@ -170,17 +179,19 @@ public:
             ? static_cast<double>(imu->timestamp_us) * 1.0e-6
             : 0.0;
         status->imu_receive_timestamp_s = imu_feedback_time_s_;
-        status->imu_age_s = imu_feedback_valid_
+        status->imu_age_s = !config_.imu.enabled ? 0.0 : imu_feedback_valid_
             ? std::max(0.0, now - imu_feedback_time_s_)
             : now - feedback_start_time_s_;
         status->imu_fresh = status->imu_received &&
             status->imu_age_s <= config_.feedback_timeout_s;
-        if (!status->imu_fresh) {
-            all_fresh = false;
-        } else {
-            if (earliest_timestamp_s == 0.0 || imu_feedback_time_s_ < earliest_timestamp_s)
-                earliest_timestamp_s = imu_feedback_time_s_;
-            latest_timestamp_s = std::max(latest_timestamp_s, imu_feedback_time_s_);
+        if (config_.imu.enabled) {
+            if (!status->imu_fresh) {
+                all_fresh = false;
+            } else {
+                if (earliest_timestamp_s == 0.0 || imu_feedback_time_s_ < earliest_timestamp_s)
+                    earliest_timestamp_s = imu_feedback_time_s_;
+                latest_timestamp_s = std::max(latest_timestamp_s, imu_feedback_time_s_);
+            }
         }
         status->feedback_window_s = earliest_timestamp_s > 0.0
             ? latest_timestamp_s - earliest_timestamp_s
