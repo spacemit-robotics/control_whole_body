@@ -537,29 +537,33 @@ RuntimeConfig LoadConfig(const std::string &main_config_path) {
 
     const YAML::Node imu = root["imu"];
     CheckKeys(imu,
-        {"driver", "device", "baud", "mounting_matrix", "acceleration_bias", "gyro_bias"},
+        {"enabled", "driver", "device", "baud", "mounting_matrix", "acceleration_bias", "gyro_bias"},
         "whole_body.imu");
-    config.imu.driver = Required<std::string>(imu, "driver", "whole_body.imu");
-    config.imu.device = Required<std::string>(imu, "device", "whole_body.imu");
-    config.imu.baud = Required<uint32_t>(imu, "baud", "whole_body.imu");
-    const auto mounting = Required<std::vector<float>>(imu, "mounting_matrix", "whole_body.imu");
-    const auto acceleration_bias =
-        Required<std::vector<float>>(imu, "acceleration_bias", "whole_body.imu");
-    const auto gyro_bias = Required<std::vector<float>>(imu, "gyro_bias", "whole_body.imu");
-    if (mounting.size() != 9 || acceleration_bias.size() != 3 || gyro_bias.size() != 3 ||
-        config.imu.driver.empty() || config.imu.device.empty() || config.imu.baud == 0)
-        throw std::runtime_error("whole_body.imu has invalid dimensions or values");
-    std::copy(mounting.begin(), mounting.end(), config.imu.mounting_matrix.begin());
-    std::copy(
-        acceleration_bias.begin(), acceleration_bias.end(), config.imu.acceleration_bias.begin());
-    std::copy(gyro_bias.begin(), gyro_bias.end(), config.imu.gyro_bias.begin());
-    for (size_t i = 0; i < config.imu.mounting_matrix.size(); ++i)
-        RequireFinite(config.imu.mounting_matrix[i], "whole_body.imu.mounting_matrix");
-    for (size_t i = 0; i < config.imu.acceleration_bias.size(); ++i) {
-        RequireFinite(config.imu.acceleration_bias[i], "whole_body.imu.acceleration_bias");
-        RequireFinite(config.imu.gyro_bias[i], "whole_body.imu.gyro_bias");
+    if (imu["enabled"])
+        config.imu.enabled = Required<bool>(imu, "enabled", "whole_body.imu");
+    if (config.imu.enabled) {
+        config.imu.driver = Required<std::string>(imu, "driver", "whole_body.imu");
+        config.imu.device = Required<std::string>(imu, "device", "whole_body.imu");
+        config.imu.baud = Required<uint32_t>(imu, "baud", "whole_body.imu");
+        const auto mounting = Required<std::vector<float>>(imu, "mounting_matrix", "whole_body.imu");
+        const auto acceleration_bias =
+            Required<std::vector<float>>(imu, "acceleration_bias", "whole_body.imu");
+        const auto gyro_bias = Required<std::vector<float>>(imu, "gyro_bias", "whole_body.imu");
+        if (mounting.size() != 9 || acceleration_bias.size() != 3 || gyro_bias.size() != 3 ||
+            config.imu.driver.empty() || config.imu.device.empty() || config.imu.baud == 0)
+            throw std::runtime_error("whole_body.imu has invalid dimensions or values");
+        std::copy(mounting.begin(), mounting.end(), config.imu.mounting_matrix.begin());
+        std::copy(acceleration_bias.begin(), acceleration_bias.end(),
+            config.imu.acceleration_bias.begin());
+        std::copy(gyro_bias.begin(), gyro_bias.end(), config.imu.gyro_bias.begin());
+        for (size_t i = 0; i < config.imu.mounting_matrix.size(); ++i)
+            RequireFinite(config.imu.mounting_matrix[i], "whole_body.imu.mounting_matrix");
+        for (size_t i = 0; i < config.imu.acceleration_bias.size(); ++i) {
+            RequireFinite(config.imu.acceleration_bias[i], "whole_body.imu.acceleration_bias");
+            RequireFinite(config.imu.gyro_bias[i], "whole_body.imu.gyro_bias");
+        }
+        ValidateRotation(config.imu.mounting_matrix);
     }
-    ValidateRotation(config.imu.mounting_matrix);
     ValidateReferences(config);
     return config;
 }

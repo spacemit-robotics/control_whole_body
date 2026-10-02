@@ -41,6 +41,7 @@ enum whole_body_mode {
     WHOLE_BODY_MODE_RL = 3,
     WHOLE_BODY_MODE_SAFETY = 4,
     WHOLE_BODY_MODE_HOME = 5,
+    WHOLE_BODY_MODE_TRAJECTORY = 6,
 };
 
 /**
@@ -282,6 +283,15 @@ struct whole_body_diagnostics_v2 {
 struct whole_body_dev;
 
 int whole_body_create(const char *main_config_path, struct whole_body_dev **out_dev);
+/**
+ * @brief Query configured IMU presence without initializing or reading devices.
+ * @return 1 if enabled, 0 if explicitly disabled, or WHOLE_BODY_ERR_STATE for an invalid device.
+ *
+ * This is a capability query, not a health check. Without an IMU, base_quat is
+ * the identity quaternion (w, x, y, z), not a measurement; timestamp_s uses the
+ * host monotonic clock, and gyro/acceleration remain zero.
+ */
+int whole_body_has_imu(struct whole_body_dev *dev);
 int whole_body_init(struct whole_body_dev *dev);
 int whole_body_read(struct whole_body_dev *dev, struct whole_body_state *state);
 int whole_body_write(struct whole_body_dev *dev, const struct whole_body_joint_command *command);

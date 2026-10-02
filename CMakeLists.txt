@@ -83,8 +83,10 @@ if(BUILD_TESTS)
         ${IMU_INCLUDE_DIR}
     )
     target_compile_definitions(test_whole_body_config PRIVATE
-        TEST_DATA_DIR="${CMAKE_CURRENT_SOURCE_DIR}/tests/data")
-    target_link_libraries(test_whole_body_config PRIVATE whole_body)
+        TEST_DATA_DIR="${CMAKE_CURRENT_SOURCE_DIR}/tests/data"
+        TEST_CONFIG_DIR="${CMAKE_CURRENT_BINARY_DIR}/config-fixtures")
+    file(MAKE_DIRECTORY "${CMAKE_CURRENT_BINARY_DIR}/config-fixtures")
+    target_link_libraries(test_whole_body_config PRIVATE whole_body yaml-cpp)
     if(CMAKE_CXX_COMPILER_ID MATCHES "GNU|Clang")
         target_compile_options(test_whole_body_config PRIVATE -UNDEBUG)
     endif()
@@ -126,6 +128,20 @@ if(BUILD_TESTS)
         target_compile_options(test_motor_write_errors PRIVATE -UNDEBUG)
     endif()
     add_test(NAME motor_write_errors COMMAND test_motor_write_errors)
+
+    # Link peripheral fakes directly so this test cannot open hardware devices.
+    add_executable(test_device_manager tests/test_device_manager.cpp src/device_manager.cpp)
+    target_include_directories(test_device_manager BEFORE PRIVATE
+        ${CMAKE_CURRENT_SOURCE_DIR}/include
+        ${CMAKE_CURRENT_SOURCE_DIR}/src
+        ${MOTOR_INCLUDE_DIR}
+        ${IMU_INCLUDE_DIR}
+    )
+    target_link_libraries(test_device_manager PRIVATE Threads::Threads)
+    if(CMAKE_CXX_COMPILER_ID MATCHES "GNU|Clang")
+        target_compile_options(test_device_manager PRIVATE -UNDEBUG -Wall -Wextra -Werror)
+    endif()
+    add_test(NAME device_manager COMMAND test_device_manager)
 
     install(TARGETS
         test_whole_body_config

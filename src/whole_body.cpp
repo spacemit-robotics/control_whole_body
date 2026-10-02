@@ -50,6 +50,10 @@ int whole_body_create(const char *main_config_path, struct whole_body_dev **out_
     }
 }
 
+int whole_body_has_imu(struct whole_body_dev *dev) {
+    return dev && dev->core ? static_cast<int>(dev->core->HasImu()) : WHOLE_BODY_ERR_STATE;
+}
+
 int whole_body_init(struct whole_body_dev *dev) {
     return dev && dev->core ? dev->core->Init() : WHOLE_BODY_ERR_STATE;
 }

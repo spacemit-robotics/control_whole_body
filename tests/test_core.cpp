@@ -8,11 +8,13 @@
 
 #include <array>
 #include <cassert>
+#include <chrono>
 #include <cmath>
 #include <cstring>
 #include <iostream>
 #include <memory>
 #include <string>
+#include <thread>
 #include <utility>
 #include <vector>
 
@@ -49,7 +51,8 @@ class DummyDevices final : public whole_body::DeviceManager {
         *motors = feedback;
         std::memset(imu, 0, sizeof(*imu));
         imu->timestamp_us = 1000000;
-        imu->quat[0] = 1.0f;
+        imu->quat[0] = invalid_imu ? NAN : 1.0f;
+        if (invalid_imu) imu->gyro[0] = imu->acc[0] = NAN;
         return 0;
     }
 
@@ -80,6 +83,7 @@ class DummyDevices final : public whole_body::DeviceManager {
     bool partial_feedback = false;
     bool partial_feedback_received = true;
     bool partial_feedback_fresh = true;
+    bool invalid_imu = false;
 };
 
 whole_body::RuntimeConfig MakeConfig(bool read_only);
@@ -256,6 +260,136 @@ whole_body_joint_command MakeCommand() {
     return command;
 }
 
+void TestOptionalImuState() {
+    auto config = MakeConfig(false);
+    config.imu.enabled = false;
+    config.imu.driver = "unused_driver";
+    config.imu.device = "unused_device";
+    auto devices = std::make_unique<DummyDevices>();
+    auto *device = devices.get();
+    device->invalid_imu = true;
+    whole_body::WholeBodyCore core(config, std::move(devices));
+    assert(!core.HasImu());
+    assert(core.Init() == WHOLE_BODY_OK);
+    device->read_result = whole_body::DEVICE_READ_WAITING;
+    device->partial_feedback = true;
+    whole_body_state state{};
+    assert(core.Read(&state) == WHOLE_BODY_ERR_STATE);
+    assert(core.LastError().find("motor_1") != std::string::npos);
+    assert(core.LastError().find("imu(") == std::string::npos);
+    assert(core.GetHealth().state == WHOLE_BODY_HEALTH_CREATED);
+
+    device->read_result = whole_body::DEVICE_READ_OK;
+    const double before = std::chrono::duration<double>(
+        std::chrono::steady_clock::now().time_since_epoch()).count();
+    assert(core.Read(&state) == WHOLE_BODY_OK);
+    const double after = std::chrono::duration<double>(
+        std::chrono::steady_clock::now().time_since_epoch()).count();
+    assert(state.timestamp_s >= before && state.timestamp_s <= after);
+    assert(state.base_quat[0] == 1.0);
+    for (size_t i = 0; i < 3; ++i) {
+        assert(state.base_quat[i + 1] == 0.0);
+        assert(state.gyro[i] == 0.0 && state.acceleration[i] == 0.0);
+    }
+    const double first_timestamp = state.timestamp_s;
+    std::this_thread::sleep_for(std::chrono::milliseconds(1));
+    assert(core.Read(&state) == WHOLE_BODY_OK);
+    assert(state.timestamp_s > first_timestamp);
+    whole_body_diagnostics diagnostics{};
+    whole_body_diagnostics_v2 extended{};
+    core.GetDiagnostics(&diagnostics);
+    core.GetDiagnosticsV2(&extended);
+    assert(diagnostics.timestamp_s == state.timestamp_s);
+    assert(extended.timestamp_s == state.timestamp_s);
+    assert(diagnostics.imu.driver[0] == '\0' && diagnostics.imu.device[0] == '\0');
+    assert(extended.imu.driver[0] == '\0' && extended.imu.device[0] == '\0');
+    assert(!diagnostics.imu.feedback_received && !diagnostics.imu.feedback_fresh);
+    assert(!extended.imu.feedback_received && !extended.imu.feedback_fresh);
+    assert(diagnostics.imu.feedback_age_s == 0.0 && extended.imu.feedback_age_s == 0.0);
+    assert(extended.imu.sample_timestamp_s == 0.0 && extended.imu.receive_timestamp_s == 0.0);
+    assert(extended.imu.valid_frames == 0);
+    for (size_t i = 0; i < 4; ++i) {
+        assert(diagnostics.imu.quaternion[i] == 0.0);
+        assert(extended.imu.quaternion[i] == 0.0);
+    }
+    assert(diagnostics.motors[0].feedback_fresh && extended.motors[1].feedback_fresh);
+
+    device->read_result = whole_body::DEVICE_READ_ERROR;
+    assert(core.Read(&state) == WHOLE_BODY_ERR_TIMEOUT);
+    assert(core.LastError().find("motor_0") != std::string::npos);
+    assert(core.LastError().find("motor_1") != std::string::npos);
+    assert(core.LastError().find("imu(") == std::string::npos);
+    assert(device->last_commands[0].mode == MOTOR_MODE_IDLE);
+    device->read_result = whole_body::DEVICE_READ_OK;
+    assert(core.Read(&state) == WHOLE_BODY_OK);
+    assert(core.GetHealth().last_error == WHOLE_BODY_ERR_TIMEOUT);
+    assert(core.SetMode(WHOLE_BODY_MODE_POWER_OFF) == WHOLE_BODY_OK);
+    device->feedback[0].err = 1;
+    assert(core.Read(&state) == WHOLE_BODY_ERR_DEVICE);
+    assert(core.SetMode(WHOLE_BODY_MODE_POWER_OFF) == WHOLE_BODY_OK);
+    device->feedback[0].err = 0;
+    device->feedback[0].pos = NAN;
+    assert(core.Read(&state) == WHOLE_BODY_ERR_STATE);
+
+    config.imu.enabled = true;
+    auto invalid_devices = std::make_unique<DummyDevices>();
+    invalid_devices->invalid_imu = true;
+    whole_body::WholeBodyCore enabled_core(config, std::move(invalid_devices));
+    assert(enabled_core.HasImu());
+    assert(enabled_core.Init() == WHOLE_BODY_OK);
+    assert(enabled_core.Read(&state) == WHOLE_BODY_ERR_STATE);
+}
+
+void TestTrajectoryMode() {
+    static_assert(WHOLE_BODY_MODE_POWER_OFF == 0 && WHOLE_BODY_MODE_DAMP == 1 &&
+        WHOLE_BODY_MODE_ZERO == 2 && WHOLE_BODY_MODE_RL == 3 && WHOLE_BODY_MODE_SAFETY == 4 &&
+        WHOLE_BODY_MODE_HOME == 5 && WHOLE_BODY_MODE_TRAJECTORY == 6, "mode ABI must be stable");
+    for (bool has_imu : {false, true}) {
+        auto config = MakeConfig(false);
+        config.imu.enabled = has_imu;
+        auto devices = std::make_unique<DummyDevices>();
+        auto *device = devices.get();
+        whole_body::WholeBodyCore core(config, std::move(devices));
+        assert(core.Init() == WHOLE_BODY_OK);
+        auto command = MakeCommand();
+        command.mode = WHOLE_BODY_MODE_TRAJECTORY;
+        assert(core.Write(command, 1.0) == WHOLE_BODY_ERR_STATE);
+        assert(device->last_commands[0].mode == MOTOR_MODE_IDLE);
+        whole_body_state state{};
+        assert(core.Read(&state) == WHOLE_BODY_OK);
+        if (has_imu) assert(state.timestamp_s == 1.0);
+        assert(core.SetMode(WHOLE_BODY_MODE_TRAJECTORY) == WHOLE_BODY_OK);
+        assert(core.Write(command, 1.0) == WHOLE_BODY_OK);
+        assert(device->last_commands[0].mode == MOTOR_MODE_HYBRID);
+        assert(std::abs(device->last_commands[0].pos_des + 0.4f) < 1.0e-6f);
+        assert(device->last_commands[0].kp == 20.0f);
+        command.actuation_mode = WHOLE_BODY_ACTUATION_POSITION;
+        assert(core.Write(command, 1.01) == WHOLE_BODY_OK);
+        assert(device->last_commands[0].mode == MOTOR_MODE_POS);
+        assert(core.Tick(1.2) == WHOLE_BODY_ERR_TIMEOUT);
+        assert(core.GetHealth().state == WHOLE_BODY_HEALTH_WATCHDOG);
+        assert(device->last_commands[0].mode == MOTOR_MODE_IDLE);
+        assert(core.SetMode(WHOLE_BODY_MODE_TRAJECTORY) == WHOLE_BODY_ERR_TIMEOUT);
+        assert(core.Write(command, 1.21) == WHOLE_BODY_ERR_TIMEOUT);
+        assert(core.SetMode(WHOLE_BODY_MODE_POWER_OFF) == WHOLE_BODY_OK);
+        command.position[0] = 10.0;
+        assert(core.Write(command, 1.22) == WHOLE_BODY_ERR_COMMAND);
+        assert(device->last_commands[0].mode == MOTOR_MODE_IDLE);
+        assert(core.SetMode(WHOLE_BODY_MODE_POWER_OFF) == WHOLE_BODY_OK);
+        assert(core.SetMode(static_cast<whole_body_mode>(7)) == WHOLE_BODY_ERR_COMMAND);
+
+        config.read_only = true;
+        config.allow_actuation = false;
+        auto read_only_devices = std::make_unique<DummyDevices>();
+        auto *read_only_device = read_only_devices.get();
+        whole_body::WholeBodyCore read_only_core(config, std::move(read_only_devices));
+        assert(read_only_core.Init() == WHOLE_BODY_OK);
+        assert(read_only_core.SetMode(WHOLE_BODY_MODE_TRAJECTORY) == WHOLE_BODY_ERR_READ_ONLY);
+        assert(read_only_core.Write(command, 1.0) == WHOLE_BODY_ERR_READ_ONLY);
+        assert(read_only_device->write_count == 0);
+    }
+}
+
 void TestStartupTimeoutRecovery() {
     for (bool initially_fresh : {false, true}) {
         auto devices = std::make_unique<DummyDevices>();
@@ -330,6 +464,8 @@ void TestPeriodicMotorPosition() {
 }  // namespace
 
 int main() {
+    TestOptionalImuState();
+    TestTrajectoryMode();
     TestStartupFeedbackGate();
     TestStartupTimeoutRecovery();
     TestPartialStartupFaults();

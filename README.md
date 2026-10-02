@@ -13,7 +13,7 @@ C 接口，可作为 `humanoid_common` 的实机 driver backend。
 
 支持：
 
-- 聚合 SocketCAN 电机与 UART IMU。
+- 聚合 SocketCAN 电机与可选 UART IMU。
 - direct 和 parallel-ankle 关节映射。
 - HYBRID、位置、速度和力矩四种执行器模式。
 - motor、software 和 split 三种关节阻抗执行方式。
@@ -101,11 +101,12 @@ whole_body:
 | 接口 | 说明 |
 | --- | --- |
 | `whole_body_create()` | 读取应用主配置和硬件配置并创建设备 |
-| `whole_body_init()` | 初始化电机、IMU 和运行状态 |
+| `whole_body_has_imu()` | 只读查询配置是否启用 IMU，返回 1/0，无效句柄返回负值 |
+| `whole_body_init()` | 初始化电机、已启用的 IMU 和运行状态 |
 | `whole_body_read()` | 读取统一关节状态和机体 IMU 状态 |
 | `whole_body_write()` | 下发统一关节命令 |
 | `whole_body_tick()` | 执行命令 watchdog 检查 |
-| `whole_body_set_mode()` | 切换 POWER_OFF、DAMP、HOME、ZERO、RL 或 SAFETY |
+| `whole_body_set_mode()` | 切换 POWER_OFF、DAMP、HOME、ZERO、RL、TRAJECTORY 或 SAFETY |
 | `whole_body_get_health()` | 获取读写周期、watchdog 和健康状态 |
 | `whole_body_get_diagnostics()` | 获取物理电机、虚拟关节和 IMU 调试快照 |
 | `whole_body_get_motor_command_diagnostics()` | 获取映射及限幅后的物理电机命令快照 |
@@ -164,7 +165,7 @@ whole_body:
   `driver_options`。
 - `joints`：关节映射、位置/速度/力矩限制和阻抗模式。
 - `couplings`：并联机构的几何参数和数值求解限制。
-- `imu`：驱动、设备、波特率、安装矩阵和零偏。
+- `imu`：启用开关、驱动、设备、波特率、安装矩阵和零偏。
 
 `joints` 的数量及顺序必须与 `robot_base.joint_names` 完全一致。
 当电机位置的等价分支相差固定周期时，可在对应电机配置 `position_period`。组件以
@@ -195,6 +196,42 @@ TORQUE 模式使用直接力矩目标；位置和速度模式无法从通用接�
 `NaN`，不执行该项门限。位置、速度和力矩变化率也只检查当前模式实际使用的命令字段。
 各上限为 `0` 时表示未启用，不能用未经实机验证的猜测值代替标定结果。
 
+### 可选 IMU
+
+`imu.enabled` 默认 `true`，省略开关时仍要求完整的原有 IMU 配置：
+
+```yaml
+whole_body:
+  imu:
+    enabled: true
+    driver: drv_uart_forsense
+    device: /dev/ttyUSB0
+    baud: 460800
+    mounting_matrix: [1, 0, 0, 0, 1, 0, 0, 0, 1]
+    acceleration_bias: [0, 0, 0]
+    gyro_bias: [0, 0, 0]
+```
+
+没有安装 IMU 时，必须在硬件 YAML 中显式关闭；不能靠缺少配置或读取失败自动降级：
+
+```yaml
+whole_body:
+  imu:
+    enabled: false
+```
+
+只有此时才跳过 IMU 其他字段的必填检查、分配、初始化、读取和反馈门控；电机逐台
+新鲜度检查、启动超时和命令 watchdog 保持不变。构建时仍依赖 `imu` 组件。
+`whole_body_has_imu(dev)` 创建后即可调用，不执行设备读写，也不表示传感器健康。
+上层必须据此明确标记“无 IMU”，不能把它展示为健康测量。
+
+无 IMU 时，成功读取的 `state.timestamp_s` 使用主机单调时钟，
+`base_quat` 为 `[1, 0, 0, 0]`（w, x, y, z）的数学默认值，`gyro` 和 `acceleration`
+为零；这些字段不是测量值，不可用于姿态估计或平衡反馈。
+两版诊断中的 IMU `driver/device` 均为空，`feedback_received/feedback_fresh` 均为
+`false`，其他 IMU 诊断字段为零。反馈超时详情只排除已禁用的 IMU，仍逐台报告异常电机。
+公开 state 和 diagnostic 结构布局不变。
+
 ### 行为状态与执行器模式
 
 `whole_body_mode` 表示整机行为和安全状态：
@@ -204,7 +241,11 @@ TORQUE 模式使用直接力矩目标；位置和速度模式无法从通用接�
 | `POWER_OFF` | 维持电机失能 |
 | `DAMP` | 强制 HYBRID，`kp=0`，仅保留受限阻尼 |
 | `HOME` / `ZERO` / `RL` | 接受上层关节目标并执行安全检查 |
+| `TRAJECTORY` | 接受上层轨迹的逐帧关节目标，执行相同映射、限幅和安全检查 |
 | `SAFETY` | 安全衰减或立即失能，并锁存故障 |
+
+`WHOLE_BODY_MODE_TRAJECTORY = 6`，既有模式值不变；轨迹生成和插值由上层负责。
+TRAJECTORY 不要求关闭 IMU，也不绕过 read-only、启动反馈、故障锁存或命令 watchdog。
 
 `whole_body_actuation_mode` 表示电机如何解释命令字段：
 
@@ -241,8 +282,8 @@ TORQUE 模式使用直接力矩目标；位置和速度模式无法从通用接�
 
 `startup_mode: read_only` 只读取反馈，拒绝执行器命令。
 `startup_mode: disabled` 在初始化后发送真实协议失能帧，并在 POWER_OFF 下持续
-维持失能；只有上层明确进入 DAMP、HOME、ZERO 或 RL 后才允许使能。
-初始化时必须取得晚于本次启动、且均未超过 `feedback_timeout_s` 的电机与 IMU 反馈；
+维持失能；只有上层明确进入 DAMP、HOME、ZERO、RL 或 TRAJECTORY 后才允许使能。
+初始化时必须取得晚于本次启动、且均未超过 `feedback_timeout_s` 的所有电机与已启用 IMU 反馈；
 在 `startup_feedback_timeout_s` 内未收齐时保持初始化状态和失能，不接受运动命令。
 超出启动窗口才报反馈超时；一旦就绪，后续反馈中断立即按运行期
 `feedback_timeout_s` 处理。设备主动报告的故障与非法反馈不等待启动窗口。

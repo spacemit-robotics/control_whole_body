@@ -32,6 +32,7 @@ class WholeBodyCore {
     int Write(const whole_body_joint_command &command, double monotonic_time_s);
     int Tick(double monotonic_time_s);
     int SetMode(whole_body_mode mode);
+    bool HasImu() const;
     whole_body_health GetHealth() const;
     void GetDiagnostics(whole_body_diagnostics *diagnostics) const;
     void GetDiagnosticsV2(whole_body_diagnostics_v2 *diagnostics) const;
