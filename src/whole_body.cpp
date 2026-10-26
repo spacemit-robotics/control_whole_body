@@ -95,6 +95,13 @@ int whole_body_get_motor_command_diagnostics(const struct whole_body_dev *dev,
     return WHOLE_BODY_OK;
 }
 
+int whole_body_get_transport_diagnostics(const struct whole_body_dev *dev,
+    struct whole_body_transport_diagnostics *diagnostics) {
+    if (!dev || !dev->core || !diagnostics) return WHOLE_BODY_ERR_STATE;
+    dev->core->GetTransportDiagnostics(diagnostics);
+    return WHOLE_BODY_OK;
+}
+
 int whole_body_get_diagnostics_v2(
     const struct whole_body_dev *dev, struct whole_body_diagnostics_v2 *diagnostics) {
     if (!dev || !dev->core || !diagnostics) return WHOLE_BODY_ERR_STATE;

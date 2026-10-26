@@ -35,32 +35,37 @@ class DummyDevices final : public whole_body::DeviceManager {
             !status) {
             return -1;
         }
-        status->motor_received.assign(feedback.size(), read_result == whole_body::DEVICE_READ_OK);
+        const bool received = read_result == whole_body::DEVICE_READ_OK || cached_feedback;
+        status->motor_received.assign(feedback.size(), received);
         status->motor_fresh.assign(feedback.size(), read_result == whole_body::DEVICE_READ_OK);
-        status->motor_age_s.assign(feedback.size(), 0.001);
-        status->imu_received = read_result == whole_body::DEVICE_READ_OK;
+        status->motor_age_s.assign(feedback.size(), feedback_age_s);
+        status->motor_timestamp_s.assign(feedback.size(), feedback_time_s);
+        status->imu_received = received;
         status->imu_fresh = read_result == whole_body::DEVICE_READ_OK;
-        status->imu_age_s = 0.001;
+        status->imu_age_s = imu_age_s;
         if (read_result == whole_body::DEVICE_READ_WAITING && partial_feedback) {
             (*motors)[0] = feedback[0];
             status->motor_received[0] = partial_feedback_received;
             status->motor_fresh[0] = partial_feedback_received && partial_feedback_fresh;
             status->motor_age_s[0] = partial_feedback_fresh ? 0.001 : 0.05;
         }
-        if (read_result != whole_body::DEVICE_READ_OK) return read_result;
+        if (read_result != whole_body::DEVICE_READ_OK && !cached_feedback) return read_result;
         *motors = feedback;
         std::memset(imu, 0, sizeof(*imu));
         imu->timestamp_us = 1000000;
         imu->quat[0] = invalid_imu ? NAN : 1.0f;
         if (invalid_imu) imu->gyro[0] = imu->acc[0] = NAN;
-        return 0;
+        return read_result;
     }
 
     int Write(const std::vector<motor_cmd> &commands) override {
         if (!initialized) return -1;
         last_commands = commands;
         ++write_count;
+        last_write_timed_out_ = false;
         if (next_write_failure < write_failures.size()) {
+            last_write_timed_out_ = next_write_failure < write_timeouts.size() &&
+                write_timeouts[next_write_failure];
             last_write_error_ = write_failures[next_write_failure++];
             return -1;
         }
@@ -77,9 +82,14 @@ class DummyDevices final : public whole_body::DeviceManager {
     std::vector<motor_cmd> last_commands;
     int write_count = 0;
     int read_result = 0;
+    double feedback_time_s = 1.0;
+    double feedback_age_s = 0.001;
+    double imu_age_s = 0.001;
     std::vector<std::string> write_failures;
+    std::vector<bool> write_timeouts;
     size_t next_write_failure = 0;
     bool initialized = false;
+    bool cached_feedback = false;
     bool partial_feedback = false;
     bool partial_feedback_received = true;
     bool partial_feedback_fresh = true;
@@ -390,6 +400,283 @@ void TestTrajectoryMode() {
     }
 }
 
+double Now() {
+    return std::chrono::duration<double>(std::chrono::steady_clock::now().time_since_epoch()).count();
+}
+
+whole_body::RuntimeConfig TolerantConfig() {
+    auto config = MakeConfig(false);
+    config.cycle_s = 0.002;
+    config.feedback_timeout_s = 0.01;
+    config.communication_tolerance_s = 0.05;
+    return config;
+}
+
+void TestCommunicationTolerance() {
+    auto devices = std::make_unique<DummyDevices>();
+    auto *device = devices.get();
+    whole_body::WholeBodyCore core(TolerantConfig(), std::move(devices));
+    assert(core.Init() == WHOLE_BODY_OK);
+    whole_body_state state{};
+    assert(core.Read(&state) == WHOLE_BODY_OK);
+    auto command = MakeCommand();
+    assert(core.Write(command, Now()) == WHOLE_BODY_OK);
+    const auto original = state;
+    const auto held = device->last_commands;
+
+    device->read_result = whole_body::DEVICE_READ_ERROR;
+    device->cached_feedback = true;
+    device->feedback[0].pos = 0.3f;
+    command.position[0] = 0.7;
+    for (double age : {0.012, 0.025, 0.045}) {
+        device->feedback_age_s = age;
+        assert(core.Read(&state) == WHOLE_BODY_RETRY);
+        assert(state.timestamp_s == original.timestamp_s);
+        assert(state.position[0] == original.position[0]);
+        assert(core.Write(command, Now()) == WHOLE_BODY_RETRY);
+        assert(core.GetHealth().state == WHOLE_BODY_HEALTH_READY);
+        for (size_t i = 0; i < held.size(); ++i) {
+            assert(device->last_commands[i].mode == MOTOR_MODE_HYBRID);
+            assert(device->last_commands[i].pos_des == held[i].pos_des);
+            assert(device->last_commands[i].kp == held[i].kp);
+            assert(device->last_commands[i].kd == held[i].kd);
+        }
+    }
+    // A cycle without a new upstream command still refreshes the held native PD.
+    device->feedback_age_s = 0.012;
+    assert(core.Read(&state) == WHOLE_BODY_RETRY);
+    const auto writes = device->write_count;
+    std::this_thread::sleep_for(std::chrono::milliseconds(3));
+    assert(core.Tick(Now()) == WHOLE_BODY_RETRY);
+    assert(device->write_count == writes + 1);
+    assert(device->last_commands[0].mode == MOTOR_MODE_HYBRID);
+
+    device->read_result = whole_body::DEVICE_READ_OK;
+    device->feedback_age_s = 0.001;
+    assert(core.Read(&state) == WHOLE_BODY_OK);
+    assert(core.Write(command, Now()) == WHOLE_BODY_OK);
+    assert(device->last_commands[0].pos_des != held[0].pos_des);
+    assert(core.GetHealth().last_error == WHOLE_BODY_OK);
+
+    // POWER_OFF is accepted during a hold, without waiting out the tolerance.
+    device->read_result = whole_body::DEVICE_READ_ERROR;
+    device->feedback_age_s = 0.02;
+    assert(core.Read(&state) == WHOLE_BODY_RETRY);
+    command.enable = false;
+    command.mode = WHOLE_BODY_MODE_POWER_OFF;
+    assert(core.Write(command, Now()) == WHOLE_BODY_OK);
+    assert(device->last_commands[0].mode == MOTOR_MODE_IDLE);
+}
+
+void TestCommunicationToleranceLimits() {
+    for (int failure = 0; failure < 4; ++failure) {
+        auto devices = std::make_unique<DummyDevices>();
+        auto *device = devices.get();
+        whole_body::WholeBodyCore core(TolerantConfig(), std::move(devices));
+        assert(core.Init() == WHOLE_BODY_OK);
+        whole_body_state state{};
+        assert(core.Read(&state) == WHOLE_BODY_OK);
+        assert(core.Write(MakeCommand(), Now()) == WHOLE_BODY_OK);
+        device->cached_feedback = true;
+        device->read_result = whole_body::DEVICE_READ_ERROR;
+        device->feedback_age_s = failure == 0 ? 0.051 : 0.012;
+        device->imu_age_s = failure == 1 ? 0.051 : 0.001;
+        if (failure == 2) device->feedback[0].err = 1;
+        if (failure == 3) device->feedback[0].pos = NAN;
+        assert(core.Read(&state) < 0);
+        assert(device->last_commands[0].mode == MOTOR_MODE_IDLE);
+        assert(core.GetHealth().state == WHOLE_BODY_HEALTH_ERROR);
+        device->read_result = whole_body::DEVICE_READ_OK;
+        device->feedback[0] = {};
+        device->feedback_age_s = device->imu_age_s = 0.001;
+        assert(core.Read(&state) == WHOLE_BODY_OK);
+        assert(core.Write(MakeCommand(), Now()) < 0);  // A real fault still requires rearming.
+    }
+}
+
+void TestTransientWriteTimeout() {
+    for (int failure = 0; failure < 3; ++failure) {
+        auto devices = std::make_unique<DummyDevices>();
+        auto *device = devices.get();
+        whole_body::WholeBodyCore core(TolerantConfig(), std::move(devices));
+        assert(core.Init() == WHOLE_BODY_OK);
+        whole_body_state state{};
+        assert(core.Read(&state) == WHOLE_BODY_OK);
+        assert(core.Write(MakeCommand(), Now()) == WHOLE_BODY_OK);
+        const int writes = device->write_count;
+        device->write_failures = {"delayed reply"};
+        device->write_timeouts = {failure != 1};
+        if (failure == 2) {
+            device->write_failures.push_back("still no reply");
+            device->write_timeouts.push_back(true);
+        }
+        const int result = core.Write(MakeCommand(), Now());
+        if (failure == 1) {
+            assert(result == WHOLE_BODY_ERR_DEVICE);
+            assert(device->last_commands[0].mode == MOTOR_MODE_IDLE);
+            continue;
+        }
+        assert(result == WHOLE_BODY_RETRY);
+        assert(device->write_count == writes + 1);  // No implicit disable transaction.
+        assert(device->last_commands[0].mode == MOTOR_MODE_HYBRID);
+        if (failure == 2) std::this_thread::sleep_for(std::chrono::milliseconds(55));
+        assert(core.Read(&state) == WHOLE_BODY_OK);
+        const int retry = core.Write(MakeCommand(), Now());
+        if (failure == 2) {
+            assert(retry == WHOLE_BODY_ERR_DEVICE);
+            assert(device->last_commands[0].mode == MOTOR_MODE_IDLE);
+        } else {
+            assert(retry == WHOLE_BODY_OK);
+            assert(device->last_commands[0].mode == MOTOR_MODE_HYBRID);
+        }
+    }
+}
+
+void TestDisabledCommunicationTolerance() {
+    for (bool tick : {false, true}) {
+        auto devices = std::make_unique<DummyDevices>();
+        auto *device = devices.get();
+        whole_body::WholeBodyCore core(TolerantConfig(), std::move(devices));
+        assert(core.Init() == WHOLE_BODY_OK);
+        whole_body_state state{};
+        assert(core.Read(&state) == WHOLE_BODY_OK);
+        auto command = MakeCommand();
+        command.mode = WHOLE_BODY_MODE_POWER_OFF;
+        command.enable = false;
+        assert(core.Write(command, Now()) == WHOLE_BODY_OK);
+        device->write_failures = {"delayed disabled reply"};
+        device->write_timeouts = {true};
+        std::this_thread::sleep_for(std::chrono::milliseconds(3));
+        assert((tick ? core.Tick(Now()) : core.Write(command, Now())) == WHOLE_BODY_RETRY);
+        assert(device->last_commands[0].mode == MOTOR_MODE_IDLE);
+        device->cached_feedback = true;
+        device->read_result = whole_body::DEVICE_READ_ERROR;
+        device->feedback_age_s = 0.015;
+        assert(core.Read(&state) == WHOLE_BODY_RETRY);
+        assert(core.GetHealth().state != WHOLE_BODY_HEALTH_ERROR);
+        device->read_result = whole_body::DEVICE_READ_OK;
+        device->feedback_age_s = 0.001;
+        assert(core.Read(&state) == WHOLE_BODY_OK);
+        assert(core.Write(command, Now()) == WHOLE_BODY_OK);
+        assert(core.GetHealth().last_error == WHOLE_BODY_OK);
+        device->read_result = whole_body::DEVICE_READ_ERROR;
+        device->feedback_age_s = 0.060;
+        assert(core.Read(&state) == WHOLE_BODY_ERR_TIMEOUT);
+        assert(device->last_commands[0].mode == MOTOR_MODE_IDLE);
+    }
+}
+
+void TestFreshFeedbackCommandHold() {
+    auto config = TolerantConfig();
+    config.command_timeout_s = 0.2;
+    config.refresh_last_command = true;
+    config.joints[0].impedance.mode = whole_body::ImpedanceMode::kSoftware;
+    auto devices = std::make_unique<DummyDevices>();
+    auto *device = devices.get();
+    whole_body::WholeBodyCore core(config, std::move(devices));
+    assert(core.Init() == WHOLE_BODY_OK);
+    whole_body_state state{};
+    assert(core.Read(&state) == WHOLE_BODY_OK);
+    const double received_at = Now();
+    assert(core.Write(MakeCommand(), received_at) == WHOLE_BODY_OK);
+    assert(core.Tick(received_at) == WHOLE_BODY_OK);
+    const double torque = device->last_commands[0].trq_des;
+    device->feedback[0].pos = 0.15f;
+    assert(core.Read(&state) == WHOLE_BODY_OK);
+    const int writes = device->write_count;
+    assert(core.Tick(received_at + 0.15) == WHOLE_BODY_OK);
+    assert(device->write_count == writes + 1);
+    assert(device->last_commands[0].mode == MOTOR_MODE_HYBRID);
+    assert(device->last_commands[0].trq_des != torque);
+    assert(core.Tick(received_at + 0.201) == WHOLE_BODY_ERR_TIMEOUT);
+    assert(device->last_commands[0].mode == MOTOR_MODE_IDLE);
+}
+
+void TestHostDampingFilter() {
+    auto config = MakeParallelConfig();
+    config.motors[0].feedback_velocity_max = 100.0;
+    for (auto &joint : config.joints)
+        joint.impedance.velocity_filter_time_constant_s = 0.01;
+    whole_body::CoupledMapping mapping(config.couplings[0]);
+    const std::array<double, 2> position{0.0, 0.0};
+    std::array<double, 2> motor_position{}, motor_velocity{}, expected_torque{};
+    assert(mapping.JointToMotor(position, &motor_position));
+    auto devices = std::make_unique<DummyDevices>();
+    auto *device = devices.get();
+    for (size_t i = 0; i < 2; ++i)
+        device->feedback[i].pos = static_cast<float>(motor_position[i]);
+    whole_body::WholeBodyCore core(config, std::move(devices));
+    assert(core.Init() == WHOLE_BODY_OK);
+    whole_body_state state{};
+    assert(core.Read(&state) == WHOLE_BODY_OK);
+    auto command = MakeCommand();
+    command.mode = WHOLE_BODY_MODE_DAMP;
+    command.kd[0] = command.kd[1] = 1.0;
+    assert(core.Write(command, 1.0) == WHOLE_BODY_OK);
+
+    const std::array<double, 2> step_velocity{2.0, -1.0};
+    assert(mapping.JointVelocityToMotor(position, step_velocity, &motor_velocity));
+    for (size_t i = 0; i < 2; ++i)
+        device->feedback[i].vel = static_cast<float>(motor_velocity[i]);
+    device->feedback_time_s += 0.002;
+    assert(core.Read(&state) == WHOLE_BODY_OK);
+    const double alpha = -std::expm1(-0.002 / 0.01);
+    auto check_damping = [&](double scale) {
+        assert(mapping.JointTorqueToMotor(position,
+            {-scale * state.velocity[0], -scale * state.velocity[1]}, &expected_torque));
+        assert(core.Write(command, device->feedback_time_s) == WHOLE_BODY_OK);
+        for (size_t i = 0; i < 2; ++i) {
+            assert(std::abs(device->last_commands[i].trq_des - expected_torque[i]) < 1.0e-5);
+            assert(std::abs(state.velocity[i] - step_velocity[i]) < 1.0e-5);
+            assert(device->last_commands[i].kp == 0.0f && device->last_commands[i].kd == 0.0f);
+        }
+    };
+    check_damping(alpha);
+    // Re-reading the same receive timestamps must not repeatedly filter a cached sample.
+    assert(core.Read(&state) == WHOLE_BODY_OK);
+    check_damping(alpha);
+    device->feedback_time_s += 0.002;
+    assert(core.Read(&state) == WHOLE_BODY_OK);
+    check_damping(1.0 - std::exp(-0.004 / 0.01));
+
+    // 500 Hz samples: attenuate a 40 Hz velocity component without altering raw feedback.
+    double raw_energy = 0.0, filtered_energy = 0.0;
+    for (int sample = 0; sample < 400; ++sample) {
+        const double speed = 2.0 * std::sin(2.0 * std::acos(-1.0) * 40.0 * sample * 0.002);
+        assert(mapping.JointVelocityToMotor(position, {speed, 0.0}, &motor_velocity));
+        for (size_t i = 0; i < 2; ++i)
+            device->feedback[i].vel = static_cast<float>(motor_velocity[i]);
+        device->feedback_time_s += 0.002;
+        assert(core.Read(&state) == WHOLE_BODY_OK);
+        assert(std::abs(state.velocity[0] - speed) < 1.0e-5);
+        assert(core.Write(command, device->feedback_time_s) == WHOLE_BODY_OK);
+        std::array<double, 2> joint_torque{};
+        assert(mapping.MotorTorqueToJoint(position,
+            {device->last_commands[0].trq_des, device->last_commands[1].trq_des}, &joint_torque));
+        if (sample >= 200) {
+            raw_energy += speed * speed;
+            filtered_energy += joint_torque[0] * joint_torque[0];
+        }
+    }
+    assert(filtered_energy < 0.25 * raw_energy);
+
+    // A receive-clock reset or long interruption seeds from the current measurement.
+    assert(mapping.JointVelocityToMotor(position, step_velocity, &motor_velocity));
+    for (size_t i = 0; i < 2; ++i)
+        device->feedback[i].vel = static_cast<float>(motor_velocity[i]);
+    device->feedback_time_s = 0.5;
+    assert(core.Read(&state) == WHOLE_BODY_OK);
+    check_damping(1.0);
+    device->feedback_time_s += 1.0;
+    assert(core.Read(&state) == WHOLE_BODY_OK);
+    check_damping(1.0);
+    // Filtering the damping path never suppresses the raw motor-speed guard.
+    device->feedback[0].vel = 101.0f;
+    device->feedback_time_s += 0.002;
+    assert(core.Read(&state) == WHOLE_BODY_ERR_STATE);
+    assert(core.LastError().find("motor_0 measured_velocity") != std::string::npos);
+}
+
 void TestStartupTimeoutRecovery() {
     for (bool initially_fresh : {false, true}) {
         auto devices = std::make_unique<DummyDevices>();
@@ -461,11 +748,312 @@ void TestPeriodicMotorPosition() {
         devices_ptr->last_commands[0].pos_des - expected_unwrapped_command) < 1.0e-6);
 }
 
+void TestProjectedCoupledImpedance() {
+    auto config = MakeParallelConfig();
+    config.couplings[0].squared_tolerance = 1e-18;
+    for (auto &joint : config.joints)
+        joint.impedance.mode = whole_body::ImpedanceMode::kMotorProjected;
+    // Exercise saturation before target projection, not rejection after projection.
+    for (auto &joint : config.joints) {
+        joint.impedance.motor_kp_max = 1.0;
+        joint.impedance.motor_kd_max = 0.25;
+    }
+    config.motors[0].polarity = -1.0;
+    config.motors[0].zero_offset = 0.1;
+    whole_body::CoupledMapping mapping(config.couplings[0]);
+    const std::array<double, 2> measured_joint{0.02, -0.01};
+    std::array<double, 2> measured_motor;
+    assert(mapping.JointToMotor(measured_joint, &measured_motor));
+    auto devices = std::make_unique<DummyDevices>();
+    auto *fake = devices.get();
+    for (size_t i = 0; i < 2; ++i) {
+        fake->feedback[i].pos = config.motors[i].polarity * measured_motor[i] +
+            config.motors[i].zero_offset;
+        fake->feedback[i].vel = 0.4f;
+    }
+    whole_body::WholeBodyCore core(config, std::move(devices));
+    assert(core.Init() == WHOLE_BODY_OK);
+    whole_body_state state{};
+    assert(core.Read(&state) == WHOLE_BODY_OK);
+    const std::array<double, 2> current{state.position[0], state.position[1]};
+    auto command = MakeCommand();
+    command.kp[0] = 4.0;
+    command.kp[1] = 6.0;
+    command.kd[0] = 1.0;
+    command.kd[1] = 2.0;
+    double time = 1.0;
+    for (const auto &reference : {std::array<double, 2>{0.07, -0.03},
+            std::array<double, 2>{-0.04, 0.06}, current}) {
+        command.position[0] = reference[0];
+        command.position[1] = reference[1];
+        for (auto mode : {WHOLE_BODY_MODE_HOME, WHOLE_BODY_MODE_ZERO, WHOLE_BODY_MODE_RL}) {
+            command.mode = mode;
+            assert(core.Write(command, time += 0.002) == WHOLE_BODY_OK);
+            std::array<double, 2> motor_p{}, joint_p{};
+            for (size_t i = 0; i < 2; ++i) {
+                const auto &sent = fake->last_commands[i];
+                motor_p[i] = config.motors[i].polarity * sent.kp *
+                    (sent.pos_des - fake->feedback[i].pos);
+                assert(sent.mode == MOTOR_MODE_HYBRID && sent.kp > 0 && sent.kd > 0);
+                assert(sent.kp <= 1.0f && sent.kd <= 0.25f);
+            }
+            assert(mapping.MotorTorqueToJoint(current, motor_p, &joint_p));
+            for (size_t i = 0; i < 2; ++i)
+                assert(std::abs(joint_p[i] - command.kp[i] * (reference[i] - current[i])) < 1e-5);
+        }
+    }
+    // Native damping must not depend on the sampled host velocity.
+    for (float speed : {-15.0f, 0.0f, 15.0f}) {
+        for (auto &feedback : fake->feedback) feedback.vel = speed;
+        assert(core.Read(&state) == WHOLE_BODY_OK);
+        command.mode = WHOLE_BODY_MODE_DAMP;
+        assert(core.Write(command, time += 0.002) == WHOLE_BODY_OK);
+        for (size_t i = 0; i < 2; ++i) {
+            const auto &sent = fake->last_commands[i];
+            assert(sent.kp == 0 && sent.trq_des == 0 && sent.vel_des == 0 && sent.kd > 0);
+        }
+    }
+    command.mode = WHOLE_BODY_MODE_RL;
+    command.position[0] = 0.05;
+    command.position[1] = -0.03;
+    for (double gain : {0.0, 1e-12}) {
+        command.kp[0] = command.kp[1] = gain;
+        assert(core.Write(command, time += 0.002) == WHOLE_BODY_OK);
+        for (size_t i = 0; i < 2; ++i)
+            assert(std::abs(fake->last_commands[i].pos_des - fake->feedback[i].pos) < 1e-7);
+    }
+    std::cout << "Projected native PD: joint proportional torque preserved across poses and modes\n";
+}
+
+void TestFeedbackPositionPolicy() {
+    for (bool check : {true, false}) {
+        auto config = MakeParallelConfig();
+        for (auto &joint : config.joints) {
+            joint.position_limit = {-0.01, 0.01};
+            joint.feedback_position_check = check;
+            joint.impedance.mode = whole_body::ImpedanceMode::kMotorProjected;
+        }
+        whole_body::CoupledMapping mapping(config.couplings[0]);
+        std::array<double, 2> motor;
+        assert(mapping.JointToMotor({0.02, -0.01}, &motor));
+        auto devices = std::make_unique<DummyDevices>();
+        auto *fake = devices.get();
+        for (size_t i = 0; i < 2; ++i) fake->feedback[i].pos = motor[i];
+        whole_body::WholeBodyCore core(config, std::move(devices));
+        assert(core.Init() == WHOLE_BODY_OK);
+        whole_body_state state{};
+        assert(core.Read(&state) == WHOLE_BODY_OK);
+        auto command = MakeCommand();
+        command.position[0] = command.position[1] = 0.0;
+        const int result = core.Write(command, 1.0);
+        assert(result == (check ? WHOLE_BODY_ERR_STATE : WHOLE_BODY_OK));
+        if (!check) {
+            // Disabling the reference-as-feedback check does not bypass invalid geometry.
+            fake->feedback[0].pos = 10.0f;
+            assert(core.Read(&state) == WHOLE_BODY_ERR_STATE);
+            for (const auto &sent : fake->last_commands) assert(sent.mode == MOTOR_MODE_IDLE);
+        }
+    }
+}
+
+void TestNativeCoupledImpedance() {
+    auto config = MakeParallelConfig();
+    // A finite-difference derivative needs solver error well below its perturbation.
+    config.couplings[0].squared_tolerance = 1e-18;
+    for (auto &joint : config.joints) joint.impedance.mode = whole_body::ImpedanceMode::kMotor;
+    config.motors[0].polarity = -1.0;
+    config.motors[0].zero_offset = 0.1;
+    whole_body::CoupledMapping mapping(config.couplings[0]);
+    const std::array<double, 2> joint_position{0.02, -0.01};
+    std::array<double, 2> motor_position;
+    assert(mapping.JointToMotor(joint_position, &motor_position));
+    auto devices = std::make_unique<DummyDevices>();
+    auto *fake = devices.get();
+    for (size_t i = 0; i < 2; ++i) {
+        fake->feedback[i].pos = config.motors[i].polarity * motor_position[i] +
+            config.motors[i].zero_offset;
+        fake->feedback[i].vel = 0.4f;
+    }
+    whole_body::WholeBodyCore core(config, std::move(devices));
+    assert(core.Init() == WHOLE_BODY_OK);
+    whole_body_state state{};
+    assert(core.Read(&state) == WHOLE_BODY_OK);
+    const std::array<double, 2> current{state.position[0], state.position[1]};
+    auto command = MakeCommand();
+    command.position[0] = 0.07;
+    command.position[1] = -0.03;
+    command.kp[0] = 4.0;
+    command.kp[1] = 6.0;
+    command.kd[0] = 1.0;
+    command.kd[1] = 2.0;
+    std::array<double, 2> target, gains, damping, feedforward, velocity;
+    assert(mapping.CheckJointTarget({0.07, -0.03}, &target));
+    assert(mapping.JointGainToMotor(current, {4.0, 6.0}, &gains));
+    assert(mapping.JointGainToMotor(current, {1.0, 2.0}, &damping));
+    assert(!mapping.JointGainToMotor(current, {-1.0, 2.0}, &damping));
+    assert(mapping.JointTorqueToMotor(current, {1.0, -2.0}, &feedforward));
+    assert(mapping.JointVelocityToMotor(current, {0.2, -0.3}, &velocity));
+    // Independent finite differences in motor space verify gain units/direction.
+    for (size_t i = 0; i < 2; ++i) {
+        auto low = motor_position, high = motor_position;
+        low[i] -= 1e-4;
+        high[i] += 1e-4;
+        std::array<double, 2> low_joint, high_joint;
+        assert(mapping.MotorToJoint(low, &low_joint));
+        assert(mapping.MotorToJoint(high, &high_joint));
+        const double a = (high_joint[0] - low_joint[0]) / 2e-4;
+        const double b = (high_joint[1] - low_joint[1]) / 2e-4;
+        assert(std::abs(gains[i] - (4.0 * a * a + 6.0 * b * b)) < 1e-3);
+    }
+    double time = 1.0;
+    for (auto mode : {WHOLE_BODY_MODE_HOME, WHOLE_BODY_MODE_ZERO, WHOLE_BODY_MODE_RL}) {
+        command.mode = mode;
+        for (auto actuation : {WHOLE_BODY_ACTUATION_HYBRID, WHOLE_BODY_ACTUATION_POSITION,
+                WHOLE_BODY_ACTUATION_VELOCITY, WHOLE_BODY_ACTUATION_TORQUE}) {
+            command.actuation_mode = actuation;
+            assert(core.Write(command, time += 0.002) == WHOLE_BODY_OK);
+            for (size_t i = 0; i < 2; ++i) {
+                const auto &sent = fake->last_commands[i];
+                const bool position = actuation == WHOLE_BODY_ACTUATION_HYBRID ||
+                    actuation == WHOLE_BODY_ACTUATION_POSITION;
+                const bool speed = actuation == WHOLE_BODY_ACTUATION_HYBRID ||
+                    actuation == WHOLE_BODY_ACTUATION_VELOCITY;
+                const bool torque = actuation == WHOLE_BODY_ACTUATION_HYBRID ||
+                    actuation == WHOLE_BODY_ACTUATION_TORQUE;
+                assert(sent.mode == (actuation == WHOLE_BODY_ACTUATION_TORQUE ?
+                    MOTOR_MODE_TRQ : MOTOR_MODE_HYBRID));
+                if (position) assert(std::abs(sent.pos_des - config.motors[i].zero_offset -
+                    config.motors[i].polarity * target[i]) < 1e-6);
+                assert(std::abs(sent.vel_des - (speed ? config.motors[i].polarity * velocity[i] : 0.0)) < 1e-6);
+                assert(std::abs(sent.trq_des - (torque ? config.motors[i].polarity * feedforward[i] : 0.0)) < 1e-6);
+                assert(std::abs(sent.kp - (position ? gains[i] : 0.0)) < 1e-6);
+                assert(std::abs(sent.kd - (actuation != WHOLE_BODY_ACTUATION_TORQUE ? damping[i] : 0.0)) < 1e-6);
+            }
+        }
+    }
+    command.mode = WHOLE_BODY_MODE_DAMP;
+    for (float speed : {-15.0f, 0.0f, 15.0f}) {
+        for (auto &feedback : fake->feedback) feedback.vel = speed;
+        assert(core.Read(&state) == WHOLE_BODY_OK);
+        assert(core.Write(command, time += 0.002) == WHOLE_BODY_OK);
+        for (size_t i = 0; i < 2; ++i) {
+            const auto &sent = fake->last_commands[i];
+            assert(sent.mode == MOTOR_MODE_HYBRID && sent.trq_des == 0.0 && sent.kp == 0.0);
+            assert(sent.vel_des == 0.0 && std::abs(sent.kd - damping[i]) < 1e-6);
+        }
+    }
+    std::cout << "Native coupled PD: target/gain/polarity/mode checks passed; no host damping residual\n";
+
+    for (auto &joint : config.joints) {
+        joint.impedance.rl_mode = whole_body::ImpedanceMode::kSplit;
+        joint.impedance.motor_kp_max = 0.0;
+        joint.impedance.motor_kd_max = 5.0;
+    }
+    auto split_devices = std::make_unique<DummyDevices>();
+    auto *split_fake = split_devices.get();
+    split_fake->feedback = fake->feedback;
+    whole_body::WholeBodyCore split_core(config, std::move(split_devices));
+    assert(split_core.Init() == WHOLE_BODY_OK);
+    for (auto &feedback : split_fake->feedback) feedback.vel = 0.4f;
+    assert(split_core.Read(&state) == WHOLE_BODY_OK);
+    fake->feedback = split_fake->feedback;
+    assert(core.Read(&state) == WHOLE_BODY_OK);
+    command.actuation_mode = WHOLE_BODY_ACTUATION_HYBRID;
+    for (auto mode : {WHOLE_BODY_MODE_DAMP, WHOLE_BODY_MODE_HOME, WHOLE_BODY_MODE_ZERO,
+            WHOLE_BODY_MODE_RL}) {
+        command.mode = mode;
+        assert(split_core.Write(command, time += 0.002) == WHOLE_BODY_OK);
+        assert(core.Write(command, time) == WHOLE_BODY_OK);
+        if (mode != WHOLE_BODY_MODE_RL) {
+            for (size_t i = 0; i < 2; ++i) {
+                const auto &a = split_fake->last_commands[i];
+                const auto &b = fake->last_commands[i];
+                assert(a.mode == b.mode && a.pos_des == b.pos_des && a.vel_des == b.vel_des &&
+                    a.trq_des == b.trq_des && a.kp == b.kp && a.kd == b.kd);
+            }
+            continue;
+        }
+        std::array<double, 2> joint_torque{}, expected_torque{};
+        for (size_t i = 0; i < 2; ++i)
+            joint_torque[i] = command.torque[i] + command.kp[i] *
+                (command.position[i] - state.position[i]) + command.kd[i] *
+                (command.velocity[i] - state.velocity[i]);
+        assert(mapping.JointTorqueToMotor(current, joint_torque, &expected_torque));
+        for (size_t i = 0; i < 2; ++i) {
+            const auto &sent = split_fake->last_commands[i];
+            assert(sent.kp == 0.0 && sent.kd > 0.0 && sent.kd <= 5.0);
+            const double total = sent.trq_des +
+                sent.kd * (sent.vel_des - split_fake->feedback[i].vel);
+            assert(std::abs(total - config.motors[i].polarity * expected_torque[i]) < 1e-5);
+        }
+    }
+    std::cout << "RL split PD: complete joint torque preserved; DAMP/HOME/ZERO commands unchanged\n";
+
+    for (auto &joint : config.joints) joint.impedance.motor_kp_max = 100.0;
+    auto position_devices = std::make_unique<DummyDevices>();
+    auto *position_fake = position_devices.get();
+    position_fake->feedback = split_fake->feedback;
+    whole_body::WholeBodyCore position_core(config, std::move(position_devices));
+    assert(position_core.Init() == WHOLE_BODY_OK);
+    assert(position_core.Read(&state) == WHOLE_BODY_OK);
+    assert(position_core.Write(command, time += 0.002) == WHOLE_BODY_OK);
+    std::array<double, 2> desired_torque{}, expected_torque{};
+    for (size_t i = 0; i < 2; ++i)
+        desired_torque[i] = command.torque[i] + command.kp[i] *
+            (command.position[i] - state.position[i]) + command.kd[i] *
+            (command.velocity[i] - state.velocity[i]);
+    assert(mapping.JointTorqueToMotor(current, desired_torque, &expected_torque));
+    for (size_t i = 0; i < 2; ++i) {
+        const auto &sent = position_fake->last_commands[i];
+        assert(sent.kp > 0.0 && sent.kd > 0.0);
+        const double total = sent.trq_des +
+            sent.kp * (sent.pos_des - position_fake->feedback[i].pos) +
+            sent.kd * (sent.vel_des - position_fake->feedback[i].vel);
+        assert(std::abs(total - config.motors[i].polarity * expected_torque[i]) < 1e-5);
+    }
+    std::cout << "Split position/damping offload preserves torque with polarity and zero offset\n";
+}
+
+void TestMeasuredVelocityGuard() {
+    for (float speed : {-2.1f, 2.1f}) {
+        auto config = MakeConfig(false);
+        config.motors[0].feedback_velocity_max = 2.0;
+        auto devices = std::make_unique<DummyDevices>();
+        auto *fake = devices.get();
+        fake->feedback[0].vel = speed;
+        whole_body::WholeBodyCore core(config, std::move(devices));
+        assert(core.Init() == WHOLE_BODY_OK);
+        whole_body_state state{};
+        assert(core.Read(&state) == WHOLE_BODY_OK);  // POWER_OFF remains observable.
+        assert(core.Write(MakeCommand(), 1.0) == WHOLE_BODY_ERR_STATE);
+        assert(core.LastError().find("motor_0 measured_velocity=") != std::string::npos);
+        for (auto &sent : fake->last_commands) assert(sent.mode == MOTOR_MODE_IDLE);
+        fake->feedback[0].vel = 0.0;
+        assert(core.Read(&state) == WHOLE_BODY_OK);
+        assert(core.Write(MakeCommand(), 1.002) == WHOLE_BODY_ERR_STATE);  // Still latched.
+        assert(core.SetMode(WHOLE_BODY_MODE_POWER_OFF) == WHOLE_BODY_OK);
+        assert(core.Write(MakeCommand(), 1.004) == WHOLE_BODY_OK);
+        fake->feedback[0].vel = speed;
+        assert(core.Read(&state) == WHOLE_BODY_ERR_STATE);  // Disable before the next Write.
+        for (auto &sent : fake->last_commands) assert(sent.mode == MOTOR_MODE_IDLE);
+    }
+}
+
 }  // namespace
 
 int main() {
     TestOptionalImuState();
     TestTrajectoryMode();
+    TestCommunicationTolerance();
+    TestCommunicationToleranceLimits();
+    TestTransientWriteTimeout();
+    TestDisabledCommunicationTolerance();
+    TestFreshFeedbackCommandHold();
+    TestHostDampingFilter();
+    TestNativeCoupledImpedance();
+    TestProjectedCoupledImpedance();
+    TestFeedbackPositionPolicy();
+    TestMeasuredVelocityGuard();
     TestStartupFeedbackGate();
     TestStartupTimeoutRecovery();
     TestPartialStartupFaults();

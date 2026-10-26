@@ -25,6 +25,10 @@ extern "C" {
 
 enum whole_body_error {
     WHOLE_BODY_OK = 0,
+    /** Temporary communication delay; keep calling read/write/tick, without rearming.
+     * Read returns the last valid state with its original timestamp. Write/tick may
+     * retain the last motor target instead of applying a new motion command. */
+    WHOLE_BODY_RETRY = 1,
     WHOLE_BODY_ERR_ALLOC = -1,
     WHOLE_BODY_ERR_CONFIG = -2,
     WHOLE_BODY_ERR_DEVICE = -3,

@@ -12,6 +12,7 @@
 #include <iostream>
 
 #include "parallel_ankle.h"
+#include "coupled_mapping.h"
 
 namespace {
 
@@ -77,6 +78,19 @@ int main() {
     const double motor_power =
         motor_velocity[0] * motor_torque[0] + motor_velocity[1] * motor_torque[1];
     assert(std::abs(joint_power - motor_power) < 1.0e-8);
+    // Adding the table implementation must not change the geometric path.
+    const whole_body::CoupledMapping coupled(MakeConfig());
+    std::array<double, 2> delegated;
+    assert(coupled.JointToMotor(joint, &delegated));
+    for (size_t i = 0; i < 2; ++i) assert(delegated[i] == motor[i]);
+    assert(coupled.JointVelocityToMotor(joint, joint_velocity, &delegated));
+    for (size_t i = 0; i < 2; ++i) assert(delegated[i] == motor_velocity[i]);
+    assert(coupled.JointTorqueToMotor(joint, joint_torque, &delegated));
+    for (size_t i = 0; i < 2; ++i) assert(delegated[i] == motor_torque[i]);
+    double coupled_condition = 0.0;
+    double coupled_amplification = 0.0;
+    assert(coupled.Metrics({0.0, 0.0}, &coupled_condition, &coupled_amplification));
+    assert(coupled_condition == condition && coupled_amplification == torque_amplification);
     std::cout << "Parallel ankle tests passed\n";
     return 0;
 }

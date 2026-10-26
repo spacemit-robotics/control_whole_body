@@ -61,12 +61,14 @@ double OptionalNonnegative(
     return value;
 }
 
-ImpedanceMode ReadImpedanceMode(const YAML::Node &node, const std::string &path) {
-    const std::string mode = Required<std::string>(node, "mode", path);
+ImpedanceMode ReadImpedanceMode(const YAML::Node &node, const std::string &path,
+    const char *key = "mode") {
+    const std::string mode = Required<std::string>(node, key, path);
     if (mode == "motor") return ImpedanceMode::kMotor;
+    if (mode == "motor_projected") return ImpedanceMode::kMotorProjected;
     if (mode == "software") return ImpedanceMode::kSoftware;
     if (mode == "split") return ImpedanceMode::kSplit;
-    throw std::runtime_error(path + ".mode must be motor, software, or split");
+    throw std::runtime_error(path + "." + key + " must be motor, motor_projected, software, or split");
 }
 
 std::array<double, 2> ReadPair(const YAML::Node &node, const std::string &path) {
@@ -190,7 +192,7 @@ void ValidateReferences(const RuntimeConfig &config) {
     for (const auto &motor : config.motors) {
         if (!command_endpoints.emplace(motor.bus, motor.command_id).second ||
             !feedback_endpoints.emplace(motor.bus, motor.feedback_id).second) {
-            throw std::runtime_error("duplicate motor CAN ID on bus '" + motor.bus + "'");
+            throw std::runtime_error("duplicate motor ID on bus '" + motor.bus + "'");
         }
     }
     for (size_t i = 0; i < config.joints.size(); ++i) {
@@ -208,6 +210,9 @@ void ValidateReferences(const RuntimeConfig &config) {
         if (joint.mapping == "direct" && !assigned_motors.insert(joint.motors[0]).second)
             throw std::runtime_error("motor '" + joint.motors[0] + "' is assigned more than once");
         if (joint.mapping == "direct") {
+            if (joint.impedance.mode == ImpedanceMode::kMotorProjected ||
+                joint.impedance.rl_mode == ImpedanceMode::kMotorProjected)
+                throw std::runtime_error("motor_projected requires a coupled joint mapping");
             const auto &motor = *motor_configs.at(joint.motors[0]);
             const double half_period = motor.position_period * 0.5;
             if (motor.position_period > 0.0 &&
@@ -217,23 +222,14 @@ void ValidateReferences(const RuntimeConfig &config) {
                     "' requires joint limits within half a position period");
             }
         }
-        if (joint.mapping == "parallel_ankle" && joint.motors.size() != 2)
+        if (joint.mapping != "direct" && joint.motors.size() != 2)
             throw std::runtime_error(
-                "parallel_ankle joint '" + joint.name + "' requires two motors");
-        if (joint.mapping == "parallel_ankle" &&
-            joint.impedance.mode != ImpedanceMode::kSoftware) {
-            throw std::runtime_error(
-                "parallel_ankle joint '" + joint.name + "' requires software impedance");
-        }
-        if (joint.impedance.mode == ImpedanceMode::kSplit && joint.mapping != "direct") {
-            throw std::runtime_error(
-                "split impedance is only supported for direct joint mappings");
-        }
+                "coupled joint '" + joint.name + "' requires two motors");
     }
     for (const auto &coupling : config.couplings) {
         for (const auto &joint : coupling.joints) {
             const auto found = joints.find(joint);
-            if (found == joints.end() || found->second->mapping != "parallel_ankle")
+            if (found == joints.end() || found->second->mapping != coupling.type)
                 throw std::runtime_error("coupling references an invalid joint '" + joint + "'");
             if (!coupled_joints.insert(joint).second)
                 throw std::runtime_error("joint '" + joint + "' belongs to multiple couplings");
@@ -251,6 +247,15 @@ void ValidateReferences(const RuntimeConfig &config) {
                     "' requires coupling motor_limit below half a position period");
             }
         }
+        const auto &first_impedance = joints.at(coupling.joints[0])->impedance;
+        const auto &second_impedance = joints.at(coupling.joints[1])->impedance;
+        if (first_impedance.mode != second_impedance.mode ||
+            first_impedance.rl_mode.value_or(first_impedance.mode) !=
+                second_impedance.rl_mode.value_or(second_impedance.mode) ||
+            first_impedance.motor_kp_max != second_impedance.motor_kp_max ||
+            first_impedance.motor_kd_max != second_impedance.motor_kd_max) {
+            throw std::runtime_error("coupled joints require the same impedance configuration");
+        }
         for (const auto &joint_name : coupling.joints) {
             const auto &joint_motors = joints.at(joint_name)->motors;
             const std::set<std::string> expected(coupling.motors.begin(), coupling.motors.end());
@@ -260,11 +265,16 @@ void ValidateReferences(const RuntimeConfig &config) {
         }
     }
     for (const auto &joint : config.joints) {
-        if (joint.mapping == "parallel_ankle" && coupled_joints.count(joint.name) == 0)
-            throw std::runtime_error("parallel ankle joint is missing a coupling");
+        if (joint.mapping != "direct" && coupled_joints.count(joint.name) == 0)
+            throw std::runtime_error("coupled joint is missing a coupling");
     }
     if (assigned_motors.size() != config.motors.size())
         throw std::runtime_error("one or more motors are not assigned to a joint mapping");
+    std::unordered_set<std::string> chain_joints;
+    for (const auto &link : config.imu.base_joint_chain) {
+        if (joints.count(link.joint) == 0 || !chain_joints.insert(link.joint).second)
+            throw std::runtime_error("IMU chain contains an unknown or duplicate joint");
+    }
 }
 
 }  // namespace
@@ -302,15 +312,20 @@ RuntimeConfig LoadConfig(const std::string &main_config_path) {
 
     const YAML::Node root = hardware["whole_body"];
     CheckKeys(root,
-        {"cycle_s", "startup_feedback_timeout_s", "feedback_timeout_s",
-            "command_timeout_s", "require_motor_receive_timestamps", "startup_mode",
+        {"cycle_s", "startup_feedback_timeout_s", "feedback_timeout_s", "communication_tolerance_s",
+            "command_timeout_s", "refresh_last_command", "require_motor_receive_timestamps", "startup_mode",
             "allow_actuation", "buses", "motors", "joints", "couplings", "imu"},
         "whole_body");
     config.cycle_s = Required<double>(root, "cycle_s", "whole_body");
     config.startup_feedback_timeout_s =
         Required<double>(root, "startup_feedback_timeout_s", "whole_body");
     config.feedback_timeout_s = Required<double>(root, "feedback_timeout_s", "whole_body");
+    if (root["communication_tolerance_s"])
+        config.communication_tolerance_s =
+            Required<double>(root, "communication_tolerance_s", "whole_body");
     config.command_timeout_s = Required<double>(root, "command_timeout_s", "whole_body");
+    if (root["refresh_last_command"])
+        config.refresh_last_command = Required<bool>(root, "refresh_last_command", "whole_body");
     if (root["require_motor_receive_timestamps"]) {
         config.require_motor_receive_timestamps =
             Required<bool>(root, "require_motor_receive_timestamps", "whole_body");
@@ -319,6 +334,7 @@ RuntimeConfig LoadConfig(const std::string &main_config_path) {
     RequireFinite(
         config.startup_feedback_timeout_s, "whole_body.startup_feedback_timeout_s");
     RequireFinite(config.feedback_timeout_s, "whole_body.feedback_timeout_s");
+    RequireFinite(config.communication_tolerance_s, "whole_body.communication_tolerance_s");
     RequireFinite(config.command_timeout_s, "whole_body.command_timeout_s");
     const double cycle_us = config.cycle_s * 1.0e6;
     if (config.cycle_s <= 0.0 || config.startup_feedback_timeout_s <= config.feedback_timeout_s ||
@@ -326,6 +342,13 @@ RuntimeConfig LoadConfig(const std::string &main_config_path) {
         config.command_timeout_s <= config.cycle_s || cycle_us < 1.0 ||
         cycle_us > static_cast<double>(std::numeric_limits<uint32_t>::max()))
         throw std::runtime_error("whole_body timing values are invalid");
+    if (config.communication_tolerance_s < 0.0 ||
+        (config.communication_tolerance_s > 0.0 &&
+            (config.communication_tolerance_s < config.feedback_timeout_s ||
+                config.communication_tolerance_s > config.command_timeout_s ||
+                config.communication_tolerance_s >= config.startup_feedback_timeout_s)))
+        throw std::runtime_error("whole_body communication tolerance must be between "
+            "feedback_timeout_s and the command/startup deadlines");
     const std::string startup = Required<std::string>(root, "startup_mode", "whole_body");
     config.allow_actuation = Required<bool>(root, "allow_actuation", "whole_body");
     if (startup == "read_only") {
@@ -356,7 +379,8 @@ RuntimeConfig LoadConfig(const std::string &main_config_path) {
         bus.type = Required<std::string>(buses[i], "type", path);
         bus.device = Required<std::string>(buses[i], "device", path);
         bus.bitrate = Required<uint32_t>(buses[i], "bitrate", path);
-        if (bus.name.empty() || bus.device.empty() || bus.type != "socketcan" || bus.bitrate == 0)
+        if (bus.name.empty() || bus.device.empty() ||
+            (bus.type != "socketcan" && bus.type != "uart") || bus.bitrate == 0)
             throw std::runtime_error(path + " is invalid");
         config.buses.push_back(std::move(bus));
     }
@@ -371,7 +395,7 @@ RuntimeConfig LoadConfig(const std::string &main_config_path) {
         CheckKeys(motors[i],
             {"name", "driver", "bus", "model", "command_id", "feedback_id", "polarity",
                 "zero_offset", "position_period", "non_fatal_error_codes", "command_limits",
-                "driver_options"},
+                "driver_options", "feedback_limits"},
             path);
         MotorConfig motor;
         motor.name = Required<std::string>(motors[i], "name", path);
@@ -382,6 +406,12 @@ RuntimeConfig LoadConfig(const std::string &main_config_path) {
         motor.feedback_id = Required<uint16_t>(motors[i], "feedback_id", path);
         motor.polarity = Required<double>(motors[i], "polarity", path);
         motor.zero_offset = Required<double>(motors[i], "zero_offset", path);
+        if (motors[i]["feedback_limits"]) {
+            const auto limits = motors[i]["feedback_limits"];
+            CheckKeys(limits, {"velocity_max"}, path + ".feedback_limits");
+            motor.feedback_velocity_max =
+                OptionalNonnegative(limits, "velocity_max", path + ".feedback_limits");
+        }
         if (motors[i]["position_period"]) {
             motor.position_period = Required<double>(motors[i], "position_period", path);
             RequireFinite(motor.position_period, path + ".position_period");
@@ -440,24 +470,35 @@ RuntimeConfig LoadConfig(const std::string &main_config_path) {
         const std::string path = "whole_body.joints[" + std::to_string(i) + "]";
         CheckKeys(joints[i],
             {"name", "mapping", "motors", "position_limit", "velocity_limit", "torque_limit",
-                "impedance"},
+                "feedback_position_check", "impedance"},
             path);
         JointConfig joint;
         joint.name = Required<std::string>(joints[i], "name", path);
         joint.mapping = Required<std::string>(joints[i], "mapping", path);
         joint.motors = Required<std::vector<std::string>>(joints[i], "motors", path);
         joint.position_limit = ReadPair(joints[i]["position_limit"], path + ".position_limit");
+        if (joints[i]["feedback_position_check"])
+            joint.feedback_position_check = Required<bool>(joints[i], "feedback_position_check", path);
         joint.velocity_limit = Required<double>(joints[i], "velocity_limit", path);
         joint.torque_limit = Required<double>(joints[i], "torque_limit", path);
-        joint.impedance.mode = joint.mapping == "parallel_ankle"
+        joint.impedance.mode = joint.mapping != "direct"
             ? ImpedanceMode::kSoftware
             : ImpedanceMode::kMotor;
         const YAML::Node impedance = joints[i]["impedance"];
         if (impedance) {
             const std::string impedance_path = path + ".impedance";
-            CheckKeys(impedance, {"mode", "motor_kp_max", "motor_kd_max"}, impedance_path);
+            CheckKeys(impedance, {"mode", "rl_mode", "motor_kp_max", "motor_kd_max",
+                "velocity_filter_time_constant_s"}, impedance_path);
             joint.impedance.mode = ReadImpedanceMode(impedance, impedance_path);
-            if (joint.impedance.mode == ImpedanceMode::kSplit) {
+            joint.impedance.velocity_filter_time_constant_s = OptionalNonnegative(
+                impedance, "velocity_filter_time_constant_s", impedance_path);
+            if (impedance["rl_mode"])
+                joint.impedance.rl_mode = ReadImpedanceMode(impedance, impedance_path, "rl_mode");
+            const bool split = joint.impedance.mode == ImpedanceMode::kSplit ||
+                joint.impedance.rl_mode == ImpedanceMode::kSplit;
+            const bool projected = joint.impedance.mode == ImpedanceMode::kMotorProjected ||
+                joint.impedance.rl_mode == ImpedanceMode::kMotorProjected;
+            if (split || (projected && (impedance["motor_kp_max"] || impedance["motor_kd_max"]))) {
                 joint.impedance.motor_kp_max =
                     Required<double>(impedance, "motor_kp_max", impedance_path);
                 joint.impedance.motor_kd_max =
@@ -473,12 +514,13 @@ RuntimeConfig LoadConfig(const std::string &main_config_path) {
                 }
             } else if (impedance["motor_kp_max"] || impedance["motor_kd_max"]) {
                 throw std::runtime_error(
-                    impedance_path + " motor gain limits are only valid in split mode");
+                    impedance_path + " motor gain limits require split or motor_projected mode");
             }
         }
         RequireFinite(joint.velocity_limit, path + ".velocity_limit");
         RequireFinite(joint.torque_limit, path + ".torque_limit");
-        if ((joint.mapping != "direct" && joint.mapping != "parallel_ankle") ||
+        if ((joint.mapping != "direct" && joint.mapping != "parallel_ankle" &&
+                joint.mapping != "table_2d") ||
             joint.position_limit[0] >= joint.position_limit[1] || joint.velocity_limit <= 0.0 ||
             joint.torque_limit <= 0.0)
             throw std::runtime_error(path + " is invalid");
@@ -494,26 +536,58 @@ RuntimeConfig LoadConfig(const std::string &main_config_path) {
             {"type", "joints", "motors", "ankle_pivots", "ball_positions", "motor_positions",
                 "motor_bias", "motor_limit", "ankle_limit", "motor_difference_limit",
                 "max_iterations", "squared_tolerance", "jacobian_condition_limit",
-                "torque_amplification_limit"},
+                "torque_amplification_limit", "table_file", "table_direction",
+                "table_output_scale", "table_interpolation"},
             path);
-        if (Required<std::string>(couplings[i], "type", path) != "parallel_ankle")
+        CouplingConfig coupling;
+        coupling.type = Required<std::string>(couplings[i], "type", path);
+        if (coupling.type != "parallel_ankle" && coupling.type != "table_2d")
             throw std::runtime_error(path + ".type is unsupported");
-        ParallelAnkleConfig coupling;
         coupling.joints = ReadStringArray<2>(couplings[i]["joints"], path + ".joints");
         coupling.motors = ReadStringArray<2>(couplings[i]["motors"], path + ".motors");
-        const YAML::Node pivots = couplings[i]["ankle_pivots"];
-        const YAML::Node balls = couplings[i]["ball_positions"];
-        const YAML::Node motor_positions = couplings[i]["motor_positions"];
-        if (!pivots || pivots.size() != 2 || !balls || balls.size() != 2 || !motor_positions ||
-            motor_positions.size() != 2)
-            throw std::runtime_error(path + " geometry must contain two sides");
-        for (size_t side = 0; side < 2; ++side) {
-            coupling.ankle_pivots[side] = ReadVec3(pivots[side], path + ".ankle_pivots");
-            coupling.ball_positions[side] = ReadVec3(balls[side], path + ".ball_positions");
-            coupling.motor_positions[side] =
-                ReadVec3(motor_positions[side], path + ".motor_positions");
+        if (coupling.joints[0] == coupling.joints[1] || coupling.motors[0] == coupling.motors[1])
+            throw std::runtime_error(path + " requires two distinct joints and motors");
+        if (coupling.type == "parallel_ankle") {
+            if (couplings[i]["table_file"] || couplings[i]["table_direction"] ||
+                couplings[i]["table_output_scale"] || couplings[i]["table_interpolation"])
+                throw std::runtime_error(path + " geometry cannot specify table_file");
+            const YAML::Node pivots = couplings[i]["ankle_pivots"];
+            const YAML::Node balls = couplings[i]["ball_positions"];
+            const YAML::Node motor_positions = couplings[i]["motor_positions"];
+            if (!pivots || pivots.size() != 2 || !balls || balls.size() != 2 || !motor_positions ||
+                motor_positions.size() != 2)
+                throw std::runtime_error(path + " geometry must contain two sides");
+            for (size_t side = 0; side < 2; ++side) {
+                coupling.ankle_pivots[side] = ReadVec3(pivots[side], path + ".ankle_pivots");
+                coupling.ball_positions[side] = ReadVec3(balls[side], path + ".ball_positions");
+                coupling.motor_positions[side] =
+                    ReadVec3(motor_positions[side], path + ".motor_positions");
+            }
+            coupling.motor_bias = ReadPair(couplings[i]["motor_bias"], path + ".motor_bias");
+        } else {
+            for (const char *key : {"ankle_pivots", "ball_positions", "motor_positions", "motor_bias"}) {
+                if (couplings[i][key]) throw std::runtime_error(path + " table cannot specify geometry");
+            }
+            const std::string file = Required<std::string>(couplings[i], "table_file", path);
+            if (file.empty()) throw std::runtime_error(path + ".table_file must not be empty");
+            coupling.table_file = ResolvePath(ParentPath(config.hardware_config_path), file);
+            coupling.table_direction = Required<std::string>(couplings[i], "table_direction", path);
+            if (couplings[i]["table_interpolation"])
+                coupling.table_interpolation = Required<std::string>(
+                    couplings[i], "table_interpolation", path);
+            if (coupling.table_interpolation != "bilinear" && coupling.table_interpolation != "delaunay")
+                throw std::runtime_error(path + ".table_interpolation is unsupported");
+            if (coupling.table_direction != "joint_to_motor" &&
+                coupling.table_direction != "motor_to_joint")
+                throw std::runtime_error(path + ".table_direction is unsupported");
+            if (couplings[i]["table_output_scale"])
+                coupling.table_output_scale = ReadPair(
+                    couplings[i]["table_output_scale"], path + ".table_output_scale");
+            for (double scale : coupling.table_output_scale) {
+                if (!std::isfinite(scale) || scale == 0.0)
+                    throw std::runtime_error(path + ".table_output_scale must be finite and nonzero");
+            }
         }
-        coupling.motor_bias = ReadPair(couplings[i]["motor_bias"], path + ".motor_bias");
         coupling.motor_limit = Required<double>(couplings[i], "motor_limit", path);
         coupling.ankle_limit = Required<double>(couplings[i], "ankle_limit", path);
         coupling.motor_difference_limit =
@@ -537,7 +611,8 @@ RuntimeConfig LoadConfig(const std::string &main_config_path) {
 
     const YAML::Node imu = root["imu"];
     CheckKeys(imu,
-        {"enabled", "driver", "device", "baud", "mounting_matrix", "acceleration_bias", "gyro_bias"},
+        {"enabled", "driver", "device", "baud", "mounting_matrix", "acceleration_bias", "gyro_bias",
+            "base_joint_chain"},
         "whole_body.imu");
     if (imu["enabled"])
         config.imu.enabled = Required<bool>(imu, "enabled", "whole_body.imu");
@@ -563,6 +638,21 @@ RuntimeConfig LoadConfig(const std::string &main_config_path) {
             RequireFinite(config.imu.gyro_bias[i], "whole_body.imu.gyro_bias");
         }
         ValidateRotation(config.imu.mounting_matrix);
+    }
+    const YAML::Node chain = imu["base_joint_chain"];
+    if (chain && (!chain.IsSequence() || chain.size() > config.num_dof))
+        throw std::runtime_error("whole_body.imu.base_joint_chain must be a bounded sequence");
+    for (size_t i = 0; chain && i < chain.size(); ++i) {
+        const std::string path = "whole_body.imu.base_joint_chain[" + std::to_string(i) + "]";
+        CheckKeys(chain[i], {"joint", "axis"}, path);
+        ImuChainJoint link;
+        link.joint = Required<std::string>(chain[i], "joint", path);
+        link.axis = ReadVec3(chain[i]["axis"], path + ".axis");
+        const double norm_squared = link.axis.x * link.axis.x + link.axis.y * link.axis.y +
+            link.axis.z * link.axis.z;
+        if (std::abs(norm_squared - 1.0) > 1.0e-6)
+            throw std::runtime_error(path + ".axis must have unit length");
+        config.imu.base_joint_chain.push_back(link);
     }
     ValidateReferences(config);
     return config;
