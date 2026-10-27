@@ -11,7 +11,7 @@
 
 #include <array>
 
-#include "whole_body_config.h"
+#include "config/whole_body_config.h"
 
 namespace whole_body {
 

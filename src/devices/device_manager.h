@@ -19,9 +19,9 @@ extern "C" {
 #include "motor.h"
 }
 
+#include "config/whole_body_config.h"
 #include "whole_body.h"
 #include "whole_body_transport.h"
-#include "whole_body_config.h"
 
 namespace whole_body {
 

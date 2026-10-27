@@ -6,7 +6,7 @@
  * @brief Internal whole-body YAML configuration loader
  */
 
-#include "whole_body_config.h"
+#include "config/whole_body_config.h"
 
 #include <yaml-cpp/yaml.h>
 

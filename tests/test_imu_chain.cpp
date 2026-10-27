@@ -5,7 +5,7 @@
  * @file test_imu_chain.cpp
  * @brief Offline articulated IMU pose/gyro tests independent of machine names.
  */
-#include "imu_chain.h"
+#include "core/imu_chain.h"
 
 #include <cassert>
 #include <cmath>

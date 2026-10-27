@@ -11,8 +11,8 @@
 #include <array>
 #include <memory>
 
-#include "parallel_ankle.h"
-#include "table_mapping.h"
+#include "mapping/parallel_ankle.h"
+#include "mapping/table_mapping.h"
 
 namespace whole_body {
 

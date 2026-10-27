@@ -13,7 +13,7 @@
 #include <string>
 #include <vector>
 
-#include "device_manager.h"
+#include "devices/device_manager.h"
 
 namespace {
 

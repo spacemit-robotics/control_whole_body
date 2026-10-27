@@ -6,7 +6,7 @@
  * @brief Generic two-link parallel ankle mapping implementation
  */
 
-#include "parallel_ankle.h"
+#include "mapping/parallel_ankle.h"
 
 #include <algorithm>
 #include <cmath>

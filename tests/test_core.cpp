@@ -18,7 +18,7 @@
 #include <utility>
 #include <vector>
 
-#include "whole_body_core.h"
+#include "core/whole_body_core.h"
 
 namespace {
 

@@ -5,7 +5,7 @@
  * @file table_mapping.cpp
  * @brief Bilinear or Delaunay-plane mapping; no extrapolation or NaN reweighting.
  */
-#include "table_mapping.h"
+#include "mapping/table_mapping.h"
 
 #include <algorithm>
 #include <cmath>

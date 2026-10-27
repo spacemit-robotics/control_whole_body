@@ -11,8 +11,8 @@
 #include <cmath>
 #include <iostream>
 
-#include "parallel_ankle.h"
-#include "coupled_mapping.h"
+#include "mapping/coupled_mapping.h"
+#include "mapping/parallel_ankle.h"
 
 namespace {
 

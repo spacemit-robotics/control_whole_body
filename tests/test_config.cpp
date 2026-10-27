@@ -15,9 +15,9 @@
 #include <stdexcept>
 #include <string>
 
-#include "device_manager.h"
+#include "config/whole_body_config.h"
+#include "devices/device_manager.h"
 #include "whole_body.h"
-#include "whole_body_config.h"
 
 namespace {
 

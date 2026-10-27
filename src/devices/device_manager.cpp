@@ -6,7 +6,7 @@
  * @brief Motor and IMU peripheral adapters
  */
 
-#include "device_manager.h"
+#include "devices/device_manager.h"
 
 #include <algorithm>
 #include <array>

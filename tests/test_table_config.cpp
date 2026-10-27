@@ -5,7 +5,7 @@
  * @file test_table_config.cpp
  * @brief Validate explicit coupled impedance modes, feedback limits and table contracts.
  */
-#include "whole_body_config.h"
+#include "config/whole_body_config.h"
 
 #include <cassert>
 #include <cstdlib>

@@ -5,7 +5,7 @@
  * @file imu_chain.cpp
  * @brief Generic articulated IMU-link orientation and angular-velocity transform.
  */
-#include "imu_chain.h"
+#include "core/imu_chain.h"
 
 #include <array>
 #include <cmath>

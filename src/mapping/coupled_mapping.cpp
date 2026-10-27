@@ -5,7 +5,7 @@
  * @file coupled_mapping.cpp
  * @brief Coupling Jacobian transforms preserving mechanical power.
  */
-#include "coupled_mapping.h"
+#include "mapping/coupled_mapping.h"
 
 #include <algorithm>
 #include <cmath>

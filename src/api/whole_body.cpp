@@ -13,9 +13,9 @@
 #include <memory>
 #include <new>
 
-#include "device_manager.h"
-#include "whole_body_config.h"
-#include "whole_body_core.h"
+#include "config/whole_body_config.h"
+#include "core/whole_body_core.h"
+#include "devices/device_manager.h"
 
 struct whole_body_dev {
     std::unique_ptr<whole_body::WholeBodyCore> core;

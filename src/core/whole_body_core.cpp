@@ -6,8 +6,8 @@
  * @brief Internal whole-body control core implementation
  */
 
-#include "whole_body_core.h"
-#include "imu_chain.h"
+#include "core/whole_body_core.h"
+#include "core/imu_chain.h"
 
 #include <algorithm>
 #include <chrono>

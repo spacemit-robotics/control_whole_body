@@ -30,14 +30,14 @@ endif()
 find_package(Delaunator REQUIRED)
 
 add_library(whole_body SHARED
-    src/device_manager.cpp
-    src/coupled_mapping.cpp
-    src/imu_chain.cpp
-    src/parallel_ankle.cpp
-    src/table_mapping.cpp
-    src/whole_body.cpp
-    src/whole_body_config.cpp
-    src/whole_body_core.cpp
+    src/api/whole_body.cpp
+    src/config/whole_body_config.cpp
+    src/core/imu_chain.cpp
+    src/core/whole_body_core.cpp
+    src/devices/device_manager.cpp
+    src/mapping/coupled_mapping.cpp
+    src/mapping/parallel_ankle.cpp
+    src/mapping/table_mapping.cpp
 )
 
 target_include_directories(whole_body
@@ -139,7 +139,7 @@ if(BUILD_TESTS)
     add_test(NAME motor_write_errors COMMAND test_motor_write_errors)
 
     # Link peripheral fakes directly so this test cannot open hardware devices.
-    add_executable(test_device_manager tests/test_device_manager.cpp src/device_manager.cpp)
+    add_executable(test_device_manager tests/test_device_manager.cpp src/devices/device_manager.cpp)
     target_include_directories(test_device_manager BEFORE PRIVATE
         ${CMAKE_CURRENT_SOURCE_DIR}/include
         ${CMAKE_CURRENT_SOURCE_DIR}/src

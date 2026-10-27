@@ -15,10 +15,10 @@
 #include <unordered_map>
 #include <vector>
 
-#include "device_manager.h"
-#include "coupled_mapping.h"
+#include "config/whole_body_config.h"
+#include "devices/device_manager.h"
+#include "mapping/coupled_mapping.h"
 #include "whole_body.h"
-#include "whole_body_config.h"
 
 namespace whole_body {
 

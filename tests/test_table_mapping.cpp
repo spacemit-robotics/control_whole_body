@@ -5,8 +5,8 @@
  * @file test_table_mapping.cpp
  * @brief Offline table inverse, finite-difference, power and domain rejection tests.
  */
-#include "coupled_mapping.h"
-#include "whole_body_core.h"
+#include "core/whole_body_core.h"
+#include "mapping/coupled_mapping.h"
 
 #include <array>
 #include <cassert>

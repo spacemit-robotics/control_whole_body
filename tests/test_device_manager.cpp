@@ -15,7 +15,7 @@
 #include <thread>
 #include <vector>
 
-#include "device_manager.h"
+#include "devices/device_manager.h"
 
 struct motor_dev {
     size_t index;

@@ -10,8 +10,8 @@
 
 #include <vector>
 
+#include "config/whole_body_config.h"
 #include "imu.h"
-#include "whole_body_config.h"
 
 namespace whole_body {
 
