@@ -7,6 +7,8 @@ set(CMAKE_CXX_STANDARD 17)
 set(CMAKE_CXX_STANDARD_REQUIRED ON)
 set(CMAKE_POSITION_INDEPENDENT_CODE ON)
 
+list(APPEND CMAKE_MODULE_PATH "${CMAKE_CURRENT_SOURCE_DIR}/cmake")
+
 find_package(Threads REQUIRED)
 find_package(yaml-cpp REQUIRED)
 find_package(motor CONFIG QUIET
@@ -25,12 +27,17 @@ if(NOT IMU_LIBRARY OR NOT IMU_INCLUDE_DIR)
     message(FATAL_ERROR "whole_body requires the installed imu component")
 endif()
 
+find_package(Delaunator REQUIRED)
+
 add_library(whole_body SHARED
-    src/device_manager.cpp
-    src/parallel_ankle.cpp
-    src/whole_body.cpp
-    src/whole_body_config.cpp
-    src/whole_body_core.cpp
+    src/api/whole_body.cpp
+    src/config/whole_body_config.cpp
+    src/core/imu_chain.cpp
+    src/core/whole_body_core.cpp
+    src/devices/device_manager.cpp
+    src/mapping/coupled_mapping.cpp
+    src/mapping/parallel_ankle.cpp
+    src/mapping/table_mapping.cpp
 )
 
 target_include_directories(whole_body
@@ -46,6 +53,7 @@ target_include_directories(whole_body
 target_link_libraries(whole_body
     PRIVATE
         yaml-cpp
+        delaunator
         ${IMU_LIBRARY}
         -Wl,--whole-archive
         components::motor
@@ -69,7 +77,8 @@ install(TARGETS whole_body
     LIBRARY DESTINATION lib
     ARCHIVE DESTINATION lib
 )
-install(FILES include/whole_body.h DESTINATION include)
+install(FILES include/whole_body.h include/whole_body_transport.h DESTINATION include)
+install(FILES NOTICE.md DESTINATION share/${PROJECT_NAME})
 
 option(BUILD_TESTS "Build whole-body offline tests" ON)
 if(BUILD_TESTS)
@@ -130,7 +139,7 @@ if(BUILD_TESTS)
     add_test(NAME motor_write_errors COMMAND test_motor_write_errors)
 
     # Link peripheral fakes directly so this test cannot open hardware devices.
-    add_executable(test_device_manager tests/test_device_manager.cpp src/device_manager.cpp)
+    add_executable(test_device_manager tests/test_device_manager.cpp src/devices/device_manager.cpp)
     target_include_directories(test_device_manager BEFORE PRIVATE
         ${CMAKE_CURRENT_SOURCE_DIR}/include
         ${CMAKE_CURRENT_SOURCE_DIR}/src
@@ -142,6 +151,14 @@ if(BUILD_TESTS)
         target_compile_options(test_device_manager PRIVATE -UNDEBUG -Wall -Wextra -Werror)
     endif()
     add_test(NAME device_manager COMMAND test_device_manager)
+    foreach(test IN ITEMS table_mapping imu_chain table_config)
+        add_executable(test_${test} tests/test_${test}.cpp)
+        target_include_directories(test_${test} PRIVATE src ${IMU_INCLUDE_DIR})
+        target_compile_options(test_${test} PRIVATE -UNDEBUG -Wall -Wextra -Werror)
+        target_compile_definitions(test_${test} PRIVATE TEST_DATA_DIR="${CMAKE_CURRENT_SOURCE_DIR}/tests/data")
+        target_link_libraries(test_${test} PRIVATE whole_body yaml-cpp)
+        add_test(NAME ${test} COMMAND test_${test})
+    endforeach()
 
     install(TARGETS
         test_whole_body_config

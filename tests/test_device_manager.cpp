@@ -15,7 +15,7 @@
 #include <thread>
 #include <vector>
 
-#include "device_manager.h"
+#include "devices/device_manager.h"
 
 struct motor_dev {
     size_t index;
@@ -153,12 +153,24 @@ motor_dev *motor_alloc_can_with_options(
     return &fake.motors[can_id];
 }
 
+motor_dev *motor_alloc_uart_with_options(
+    const char *name, const char *path, uint32_t, uint8_t id, const motor_option *options, uint32_t count) {
+    return motor_alloc_can_with_options(name, path, id, options, count);
+}
+
 int motor_init(motor_dev **, uint32_t count) {
     fake.motor_initializations += count;
     return 0;
 }
 
 int motor_set_cmds(motor_dev **, const motor_cmd *, uint32_t) { return 0; }
+
+int motor_set_cmds_ex(motor_dev **, const motor_cmd *, int *results, uint32_t count) {
+    for (uint32_t i = 0; i < count; ++i) results[i] = 0;
+    return 0;
+}
+
+int motor_get_transport_diagnostics(motor_dev *, motor_transport_diagnostics *) { return -1; }
 
 int motor_get_states(motor_dev **devices, motor_state *states, uint32_t count) {
     assert(count == 1);
@@ -174,6 +186,15 @@ int motor_get_feedback_timestamps(motor_dev **devices, uint64_t *timestamps, uin
     const size_t index = devices[0]->index;
     timestamps[0] = fake.motor_has_timestamp[index] ? fake.motor_timestamps[index] : 0;
     return 0;
+}
+
+int motor_get_states_ex(motor_dev **devices, motor_state *states, int *results, uint32_t count) {
+    int result = 0;
+    for (uint32_t i = 0; i < count; ++i) {
+        results[i] = motor_get_states(devices + i, states + i, 1);
+        if (results[i] != 0) result = -1;
+    }
+    return result;
 }
 
 void motor_free(motor_dev **, uint32_t count) { fake.motor_frees += count; }

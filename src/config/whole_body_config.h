@@ -11,6 +11,7 @@
 
 #include <array>
 #include <cstdint>
+#include <optional>
 #include <string>
 #include <vector>
 
@@ -47,6 +48,8 @@ struct MotorConfig {
     double polarity = 1.0;
     double zero_offset = 0.0;
     double position_period = 0.0;
+    // Absolute measured shaft speed; zero leaves this opt-in guard disabled.
+    double feedback_velocity_max = 0.0;
     std::vector<uint32_t> non_fatal_error_codes;
     MotorCommandLimits command_limits;
     std::vector<DriverOption> driver_options;
@@ -56,12 +59,16 @@ enum class ImpedanceMode {
     kMotor,
     kSoftware,
     kSplit,
+    kMotorProjected,
 };
 
 struct ImpedanceConfig {
     ImpedanceMode mode = ImpedanceMode::kMotor;
     double motor_kp_max = 0.0;
     double motor_kd_max = 0.0;
+    // Host damping only; zero preserves the unfiltered feedback path.
+    double velocity_filter_time_constant_s = 0.0;
+    std::optional<ImpedanceMode> rl_mode;
 };
 
 struct JointConfig {
@@ -69,6 +76,9 @@ struct JointConfig {
     std::string mapping;
     std::vector<std::string> motors;
     std::array<double, 2> position_limit{};
+    // A reference range is not necessarily a measured-position shutdown threshold.
+    // Coupled mechanisms may instead be bounded by their calibrated mapping domain.
+    bool feedback_position_check = true;
     double velocity_limit = 0.0;
     double torque_limit = 0.0;
     ImpedanceConfig impedance;
@@ -80,7 +90,12 @@ struct Vec3 {
     double z = 0.0;
 };
 
-struct ParallelAnkleConfig {
+struct CouplingConfig {
+    std::string type = "parallel_ankle";
+    std::string table_file;
+    std::string table_direction = "joint_to_motor";
+    std::string table_interpolation = "bilinear";
+    std::array<double, 2> table_output_scale{1.0, 1.0};
     std::array<std::string, 2> joints;
     std::array<std::string, 2> motors;
     std::array<Vec3, 2> ankle_pivots;
@@ -96,6 +111,14 @@ struct ParallelAnkleConfig {
     double torque_amplification_limit = 0.0;
 };
 
+// Preserve the existing geometric solver's source interface.
+using ParallelAnkleConfig = CouplingConfig;
+
+struct ImuChainJoint {
+    std::string joint;
+    Vec3 axis;
+};
+
 struct ImuConfig {
     bool enabled = true;
     std::string driver;
@@ -104,6 +127,7 @@ struct ImuConfig {
     std::array<float, 9> mounting_matrix{};
     std::array<float, 3> acceleration_bias{};
     std::array<float, 3> gyro_bias{};
+    std::vector<ImuChainJoint> base_joint_chain;
 };
 
 struct RuntimeConfig {
@@ -114,7 +138,10 @@ struct RuntimeConfig {
     double cycle_s = 0.0;
     double startup_feedback_timeout_s = 0.0;
     double feedback_timeout_s = 0.0;
+    // Opt-in total outage bound, not an additional delay after feedback_timeout_s.
+    double communication_tolerance_s = 0.0;
     double command_timeout_s = 0.0;
+    bool refresh_last_command = false;
     bool require_motor_receive_timestamps = false;
     bool read_only = true;
     bool allow_actuation = false;
@@ -122,7 +149,7 @@ struct RuntimeConfig {
     std::vector<BusConfig> buses;
     std::vector<MotorConfig> motors;
     std::vector<JointConfig> joints;
-    std::vector<ParallelAnkleConfig> couplings;
+    std::vector<CouplingConfig> couplings;
     ImuConfig imu;
 };
 

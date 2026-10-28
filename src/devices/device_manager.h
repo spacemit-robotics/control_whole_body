@@ -19,8 +19,9 @@ extern "C" {
 #include "motor.h"
 }
 
+#include "config/whole_body_config.h"
 #include "whole_body.h"
-#include "whole_body_config.h"
+#include "whole_body_transport.h"
 
 namespace whole_body {
 
@@ -81,16 +82,21 @@ public:
         DeviceFeedbackStatus *status) = 0;
     virtual int Write(const std::vector<motor_cmd> &commands) = 0;
     virtual void Shutdown() = 0;
+    virtual void GetTransportDiagnostics(whole_body_transport_diagnostics *diagnostics) const {
+        *diagnostics = {};
+    }
     const std::string &LastWriteError() const { return last_write_error_; }
+    bool LastWriteTimedOut() const { return last_write_timed_out_; }
 
 protected:
     std::string last_write_error_;
+    bool last_write_timed_out_ = false;
 };
 
 using MotorCommandWriter = int (*)(motor_dev *, const motor_cmd *);
 int WriteMotorCommands(const RuntimeConfig &config, const std::vector<motor_dev *> &motors,
     const std::vector<motor_cmd> &commands, std::string *error,
-    MotorCommandWriter write_command = motor_set_cmd_one);
+    MotorCommandWriter write_command = nullptr, bool *timeout_only = nullptr);
 
 std::vector<DriverOption> BuildMotorDriverOptions(const MotorConfig &motor);
 std::unique_ptr<DeviceManager> CreatePeripheralDevices(const RuntimeConfig &config);

@@ -6,7 +6,8 @@
  * @brief Internal whole-body control core implementation
  */
 
-#include "whole_body_core.h"
+#include "core/whole_body_core.h"
+#include "core/imu_chain.h"
 
 #include <algorithm>
 #include <chrono>
@@ -86,6 +87,10 @@ bool UsesDamping(const whole_body_joint_command &command) {
         command.actuation_mode != WHOLE_BODY_ACTUATION_TORQUE;
 }
 
+ImpedanceMode EffectiveImpedanceMode(const ImpedanceConfig &config, whole_body_mode mode) {
+    return mode == WHOLE_BODY_MODE_RL ? config.rl_mode.value_or(config.mode) : config.mode;
+}
+
 double ComputeJointTorque(const whole_body_joint_command &command, size_t joint_index,
     double current_position, double current_velocity) {
     if (command.mode == WHOLE_BODY_MODE_DAMP)
@@ -151,6 +156,10 @@ WholeBodyCore::WholeBodyCore(RuntimeConfig config, std::unique_ptr<DeviceManager
         motor_indices_.emplace(config_.motors[i].name, i);
     for (size_t i = 0; i < config_.joints.size(); ++i)
         joint_indices_.emplace(config_.joints[i].name, i);
+    for (const auto &link : config_.imu.base_joint_chain)
+        imu_chain_indices_.push_back(joint_indices_.at(link.joint));
+    imu_chain_positions_.resize(imu_chain_indices_.size());
+    imu_chain_velocities_.resize(imu_chain_indices_.size());
     reference_position_limits_.reserve(config_.joints.size());
     for (const auto &joint : config_.joints)
         reference_position_limits_.push_back(joint.position_limit);
@@ -160,16 +169,25 @@ WholeBodyCore::WholeBodyCore(RuntimeConfig config, std::unique_ptr<DeviceManager
             joint_indices_.at(coupling.joints[1]),
         };
         couplings_.push_back({
-            ParallelAnkle(coupling),
+            CoupledMapping(coupling),
             joint_indices,
             {motor_indices_.at(coupling.motors[0]), motor_indices_.at(coupling.motors[1])},
         });
-        for (size_t joint_index : joint_indices) {
-            reference_position_limits_[joint_index] = {
-                -coupling.ankle_limit, coupling.ankle_limit};
+        if (coupling.type == "parallel_ankle") {
+            for (size_t joint_index : joint_indices) {
+                reference_position_limits_[joint_index] = {
+                    -coupling.ankle_limit, coupling.ankle_limit};
+            }
         }
     }
     motor_states_.resize(config_.motors.size());
+    motor_position_buffer_.resize(config_.motors.size());
+    motor_velocity_buffer_.resize(config_.motors.size());
+    motor_torque_buffer_.resize(config_.motors.size());
+    command_buffer_.resize(config_.motors.size());
+    metrics_buffer_.resize(config_.motors.size());
+    idle_buffer_.resize(config_.motors.size());
+    for (auto &command : idle_buffer_) command.mode = MOTOR_MODE_IDLE;
     motor_position_branch_offsets_.resize(config_.motors.size());
     previous_motor_raw_positions_.resize(config_.motors.size());
     motor_position_branch_initialized_.resize(config_.motors.size());
@@ -177,6 +195,8 @@ WholeBodyCore::WholeBodyCore(RuntimeConfig config, std::unique_ptr<DeviceManager
     last_motor_command_metrics_.resize(config_.motors.size());
     joint_position_.resize(config_.joints.size());
     joint_velocity_.resize(config_.joints.size());
+    damping_velocity_.resize(config_.joints.size());
+    damping_timestamp_s_.assign(config_.joints.size(), -1.0);
     health_.state = WHOLE_BODY_HEALTH_CREATED;
 }
 
@@ -211,6 +231,9 @@ int WholeBodyCore::Init() {
     mode_ = WHOLE_BODY_MODE_POWER_OFF;
     has_command_ = false;
     has_joint_state_ = false;
+    feedback_hold_active_ = false;
+    write_timeout_since_s_ = -1.0;
+    std::fill(damping_timestamp_s_.begin(), damping_timestamp_s_.end(), -1.0);
     last_idle_time_s_ = 0.0;
     health_.last_error = WHOLE_BODY_OK;
     health_.state = WHOLE_BODY_HEALTH_CREATED;
@@ -253,11 +276,44 @@ double WholeBodyCore::NormalizedMotorPosition(size_t index) const {
         motor_position_branch_offsets_[index];
 }
 
+void WholeBodyCore::UpdateDampingVelocity(size_t joint_index, double velocity) {
+    const auto &joint = config_.joints[joint_index];
+    const double time_constant = joint.impedance.velocity_filter_time_constant_s;
+    double &filtered = damping_velocity_[joint_index];
+    if (time_constant <= 0.0) {
+        filtered = velocity;
+        return;
+    }
+    // A cached read must not advance the filter. For coupled feedback use the
+    // oldest motor receipt, so advancing only the faster member is insufficient.
+    double timestamp = std::numeric_limits<double>::infinity();
+    for (const auto &name : joint.motors) {
+        const size_t index = motor_indices_.at(name);
+        if (index >= feedback_status_.motor_timestamp_s.size() ||
+            !std::isfinite(feedback_status_.motor_timestamp_s[index]) ||
+            feedback_status_.motor_timestamp_s[index] <= 0.0) {
+            timestamp = MonotonicTime();
+            break;
+        }
+        timestamp = std::min(timestamp, feedback_status_.motor_timestamp_s[index]);
+    }
+    double &previous = damping_timestamp_s_[joint_index];
+    const double elapsed = timestamp - previous;
+    if (!has_joint_state_ || previous < 0.0 || elapsed < 0.0 ||
+        elapsed > config_.feedback_timeout_s) {
+        filtered = velocity;
+    } else if (elapsed > 0.0) {
+        filtered += -std::expm1(-elapsed / time_constant) * (velocity - filtered);
+    }
+    previous = timestamp;
+}
+
 int WholeBodyCore::Read(whole_body_state *state) {
     if (!initialized_ || !state)
         return Fail(WHOLE_BODY_ERR_STATE, "whole-body backend is not initialized");
     const int read_result =
         devices_->Read(&motor_states_, &imu_state_, &feedback_status_);
+    feedback_read_time_s_ = MonotonicTime();
     for (size_t i = 0; i < motor_states_.size(); ++i) {
         if (i >= feedback_status_.motor_received.size() || !feedback_status_.motor_received[i])
             continue;
@@ -283,19 +339,34 @@ int WholeBodyCore::Read(whole_body_state *state) {
         return EnterSafety(WHOLE_BODY_ERR_CONFIG,
             DescribeFeedbackProblem("motor feedback timestamp requirement not met"));
     }
+    if (has_command_) {
+        std::string reason;
+        if (!ValidateMotorFeedback(&reason)) return EnterSafety(WHOLE_BODY_ERR_STATE, reason);
+    }
     if (read_result < 0) {
+        if (CanTolerateCommunication(feedback_read_time_s_) ||
+            CanTolerateDisabledCommunication(feedback_read_time_s_)) {
+            feedback_hold_active_ = has_command_;
+            *state = last_state_;
+            health_.last_error = WHOLE_BODY_RETRY;
+            last_error_ = DescribeFeedbackProblem(has_command_
+                ? "temporary feedback delay; holding motor targets"
+                : "temporary feedback delay; motors remain disabled");
+            return WHOLE_BODY_RETRY;
+        }
         return EnterSafety(WHOLE_BODY_ERR_TIMEOUT,
             DescribeFeedbackProblem("feedback timed out"));
     }
+    feedback_hold_active_ = false;
     UpdateMotorPositionBranches();
 
     std::memset(state, 0, sizeof(*state));
     state->num_dof = config_.num_dof;
     state->timestamp_s = config_.imu.enabled
         ? static_cast<double>(imu_state_.timestamp_us) * 1.0e-6 : MonotonicTime();
-    std::vector<double> motor_position(config_.motors.size());
-    std::vector<double> motor_velocity(config_.motors.size());
-    std::vector<double> motor_torque(config_.motors.size());
+    auto &motor_position = motor_position_buffer_;
+    auto &motor_velocity = motor_velocity_buffer_;
+    auto &motor_torque = motor_torque_buffer_;
     for (size_t i = 0; i < config_.motors.size(); ++i) {
         const auto &motor = config_.motors[i];
         motor_position[i] =
@@ -337,13 +408,13 @@ int WholeBodyCore::Read(whole_body_state *state) {
             !coupling.mapping.MotorTorqueToJoint(
                 joint_position, coupled_motor_torque, &joint_torque)) {
             return EnterSafety(
-                WHOLE_BODY_ERR_STATE, "parallel ankle feedback is outside its solvable domain");
+                WHOLE_BODY_ERR_STATE, "coupled joint feedback is outside its solvable domain");
         }
         coupling.metrics_valid = coupling.mapping.Metrics(joint_position,
             &coupling.jacobian_condition, &coupling.torque_amplification);
         if (!coupling.metrics_valid) {
             return EnterSafety(
-                WHOLE_BODY_ERR_STATE, "parallel ankle Jacobian is singular");
+                WHOLE_BODY_ERR_STATE, "coupling Jacobian is singular");
         }
         const auto &coupling_config = coupling.mapping.Config();
         if ((coupling_config.jacobian_condition_limit > 0.0 &&
@@ -351,7 +422,7 @@ int WholeBodyCore::Read(whole_body_state *state) {
             (coupling_config.torque_amplification_limit > 0.0 &&
                 coupling.torque_amplification > coupling_config.torque_amplification_limit)) {
             std::ostringstream message;
-            message << "parallel ankle mapping exceeds safety limit: condition="
+            message << "coupling mapping exceeds safety limit: condition="
                     << coupling.jacobian_condition << ", torque_amplification="
                     << coupling.torque_amplification;
             return EnterSafety(WHOLE_BODY_ERR_STATE, message.str());
@@ -375,15 +446,27 @@ int WholeBodyCore::Read(whole_body_state *state) {
 
     state->base_quat[0] = 1.0;
     if (config_.imu.enabled) {
-        for (size_t i = 0; i < 4; ++i) state->base_quat[i] = imu_state_.quat[i];
+        imu_data base_imu = imu_state_;
+        if (!config_.imu.base_joint_chain.empty()) {
+            for (size_t i = 0; i < imu_chain_indices_.size(); ++i) {
+                const size_t index = imu_chain_indices_[i];
+                imu_chain_positions_[i] = state->position[index];
+                imu_chain_velocities_[i] = state->velocity[index];
+            }
+            if (!TransformImuToBase(config_.imu.base_joint_chain,
+                    imu_chain_positions_, imu_chain_velocities_, imu_state_, &base_imu))
+                return EnterSafety(WHOLE_BODY_ERR_STATE, "IMU joint-chain transform failed");
+        }
+        for (size_t i = 0; i < 4; ++i) state->base_quat[i] = base_imu.quat[i];
         for (size_t i = 0; i < 3; ++i) {
-            state->gyro[i] = imu_state_.gyro[i];
-            state->acceleration[i] = imu_state_.acc[i];
+            state->gyro[i] = base_imu.gyro[i];
+            state->acceleration[i] = base_imu.acc[i];
         }
     }
     for (size_t i = 0; i < config_.joints.size(); ++i) {
         joint_position_[i] = state->position[i];
         joint_velocity_[i] = state->velocity[i];
+        UpdateDampingVelocity(i, state->velocity[i]);
     }
     has_joint_state_ = true;
     last_state_ = *state;
@@ -476,6 +559,7 @@ bool WholeBodyCore::ValidateJointPositions(
     for (size_t i = 0; i < config_.joints.size(); ++i) {
         const auto &joint = config_.joints[i];
         const double position = state.position[i];
+        if (!joint.feedback_position_check) continue;
         if (position >= joint.position_limit[0] - kPositionLimitTolerance &&
             position <= joint.position_limit[1] + kPositionLimitTolerance) {
             continue;
@@ -492,8 +576,25 @@ bool WholeBodyCore::ValidateJointPositions(
     return true;
 }
 
+bool WholeBodyCore::ValidateMotorFeedback(std::string *reason) const {
+    for (size_t i = 0; i < config_.motors.size(); ++i) {
+        const auto &motor = config_.motors[i];
+        if (motor.feedback_velocity_max <= 0.0 ||
+            std::abs(motor_states_[i].vel) <= motor.feedback_velocity_max) continue;
+        if (reason) {
+            std::ostringstream message;
+            message << motor.name << " measured_velocity=" << motor_states_[i].vel
+                    << " exceeds limit " << motor.feedback_velocity_max;
+            *reason = message.str();
+        }
+        return false;
+    }
+    return true;
+}
+
 int WholeBodyCore::BuildMotorCommands(
-    const whole_body_joint_command &command, std::vector<motor_cmd> *motor_commands) {
+    const whole_body_joint_command &command, std::vector<motor_cmd> *motor_commands,
+    std::string *reason) {
     if (!motor_commands) return WHOLE_BODY_ERR_COMMAND;
     motor_commands->assign(config_.motors.size(), motor_cmd{});
     if (!command.enable || command.mode == WHOLE_BODY_MODE_POWER_OFF) {
@@ -520,7 +621,8 @@ int WholeBodyCore::BuildMotorCommands(
         const auto &joint = config_.joints[joint_index];
         if (joint.mapping != "direct") continue;
         const size_t motor_index = motor_indices_.at(joint.motors[0]);
-        if (joint.impedance.mode == ImpedanceMode::kMotor) {
+        const auto impedance_mode = EffectiveImpedanceMode(joint.impedance, command.mode);
+        if (impedance_mode == ImpedanceMode::kMotor) {
             position[motor_index] = command.position[joint_index];
             velocity[motor_index] = command.velocity[joint_index];
             torque[motor_index] = command.torque[joint_index];
@@ -540,12 +642,13 @@ int WholeBodyCore::BuildMotorCommands(
             ? command.velocity[joint_index]
             : 0.0;
         const double desired_torque = std::clamp(
-            ComputeJointTorque(command, joint_index, current_position, current_velocity),
+            ComputeJointTorque(command, joint_index, current_position,
+                damping_velocity_[joint_index]),
             -joint.torque_limit, joint.torque_limit);
 
         double motor_kp = 0.0;
         double motor_kd = 0.0;
-        if (joint.impedance.mode == ImpedanceMode::kSplit) {
+        if (impedance_mode == ImpedanceMode::kSplit) {
             if (UsesPositionTarget(command)) {
                 motor_kp = std::min(command.kp[joint_index],
                     joint.impedance.motor_kp_max);
@@ -580,6 +683,33 @@ int WholeBodyCore::BuildMotorCommands(
 
     if (!couplings_.empty() && !has_joint_state_) return WHOLE_BODY_ERR_STATE;
     for (const auto &coupling : couplings_) {
+        std::array<double, 2> target_motor_position{};
+        const auto &impedance = config_.joints[coupling.joint_indices[0]].impedance;
+        const auto impedance_mode = EffectiveImpedanceMode(impedance, command.mode);
+        const bool projected_impedance = impedance_mode == ImpedanceMode::kMotorProjected;
+        const bool native_impedance = impedance_mode == ImpedanceMode::kMotor || projected_impedance;
+        const bool split_impedance = impedance_mode == ImpedanceMode::kSplit;
+        const bool motor_position_control = impedance_mode == ImpedanceMode::kMotor ||
+            (split_impedance && impedance.motor_kp_max > 0.0);
+        // Inverse-position modes require a reachable reference pose. Software and
+        // projected PD instead use that reference to calculate effort, evaluating
+        // the mapping at the measured pose. Final motor bounds still apply.
+        if (motor_position_control && UsesPositionTarget(command) &&
+            !coupling.mapping.CheckJointTarget({command.position[coupling.joint_indices[0]],
+                command.position[coupling.joint_indices[1]]}, &target_motor_position)) {
+            if (reason) {
+                std::ostringstream message;
+                message << "coupled motor position target rejected: ";
+                for (size_t side = 0; side < 2; ++side) {
+                    const size_t index = coupling.joint_indices[side];
+                    if (side != 0) message << ", ";
+                    message << config_.joints[index].name << "=" << command.position[index];
+                }
+                message << " (inverse mapping or Jacobian limit)";
+                *reason = message.str();
+            }
+            return WHOLE_BODY_ERR_COMMAND;
+        }
         const std::array<double, 2> target_joint_velocity = {
             command.velocity[coupling.joint_indices[0]],
             command.velocity[coupling.joint_indices[1]],
@@ -588,26 +718,35 @@ int WholeBodyCore::BuildMotorCommands(
             joint_position_[coupling.joint_indices[0]],
             joint_position_[coupling.joint_indices[1]],
         };
-        const std::array<double, 2> current_joint_velocity = {
-            joint_velocity_[coupling.joint_indices[0]],
-            joint_velocity_[coupling.joint_indices[1]],
-        };
         const bool damp_mode = command.mode == WHOLE_BODY_MODE_DAMP;
         const std::array<double, 2> mapped_joint_velocity =
             UsesVelocityTarget(command)
             ? target_joint_velocity
             : std::array<double, 2>{0.0, 0.0};
         std::array<double, 2> joint_torque{};
+        std::array<double, 2> joint_kp{}, joint_kd{};
         for (size_t side = 0; side < 2; ++side) {
             const size_t joint_index = coupling.joint_indices[side];
-            joint_torque[side] = ComputeJointTorque(command, joint_index,
-                current_joint_position[side], current_joint_velocity[side]);
+            if (native_impedance) {
+                // Only feedforward torque belongs in the host torque command.
+                // Never add -D*v or a cross-axis PD residual to this native loop.
+                const bool uses_feedforward = !damp_mode &&
+                    (command.actuation_mode == WHOLE_BODY_ACTUATION_HYBRID ||
+                        command.actuation_mode == WHOLE_BODY_ACTUATION_TORQUE);
+                joint_torque[side] = uses_feedforward ? command.torque[joint_index] : 0.0;
+            } else {
+                joint_torque[side] = ComputeJointTorque(command, joint_index,
+                    current_joint_position[side], damping_velocity_[joint_index]);
+            }
+            joint_kp[side] = UsesPositionTarget(command) ? command.kp[joint_index] : 0.0;
+            joint_kd[side] = UsesDamping(command) ? command.kd[joint_index] : 0.0;
             const double torque_limit = config_.joints[joint_index].torque_limit;
             joint_torque[side] = std::clamp(joint_torque[side], -torque_limit, torque_limit);
         }
         std::array<double, 2> coupled_position;
         std::array<double, 2> coupled_velocity;
         std::array<double, 2> coupled_torque;
+        std::array<double, 2> coupled_kp{}, coupled_kd{};
         if (!coupling.mapping.JointToMotor(current_joint_position, &coupled_position) ||
             !coupling.mapping.JointVelocityToMotor(
                 current_joint_position, mapped_joint_velocity, &coupled_velocity) ||
@@ -615,13 +754,74 @@ int WholeBodyCore::BuildMotorCommands(
                 current_joint_position, joint_torque, &coupled_torque)) {
             return WHOLE_BODY_ERR_COMMAND;
         }
+        if (native_impedance || split_impedance) {
+            if (!coupling.mapping.JointGainToMotor(
+                    current_joint_position, joint_kp, &coupled_kp, split_impedance) ||
+                !coupling.mapping.JointGainToMotor(
+                    current_joint_position, joint_kd, &coupled_kd, split_impedance)) {
+                return WHOLE_BODY_ERR_COMMAND;
+            }
+            if (motor_position_control && UsesPositionTarget(command)) coupled_position = target_motor_position;
+        }
+        if (projected_impedance) {
+            // Projected native PD must divide by the gain actually sent to the motor.
+            // Clipping only after target generation would change the requested P effort.
+            // Zero leaves a projected cap unspecified (legacy behavior).
+            for (size_t side = 0; side < 2; ++side) {
+                if (impedance.motor_kp_max > 0.0)
+                    coupled_kp[side] = std::min(coupled_kp[side], impedance.motor_kp_max);
+                if (impedance.motor_kd_max > 0.0)
+                    coupled_kd[side] = std::min(coupled_kd[side], impedance.motor_kd_max);
+                coupled_kp[side] = static_cast<float>(coupled_kp[side]);
+                coupled_kd[side] = static_cast<float>(coupled_kd[side]);
+            }
+            std::array<double, 2> proportional_torque{};
+            for (size_t side = 0; side < 2; ++side) {
+                if (UsesPositionTarget(command))
+                    proportional_torque[side] = joint_kp[side] *
+                        (command.position[coupling.joint_indices[side]] - current_joint_position[side]);
+            }
+            std::array<double, 2> motor_proportional_torque{};
+            if (!coupling.mapping.JointTorqueToMotor(
+                    current_joint_position, proportional_torque, &motor_proportional_torque))
+                return WHOLE_BODY_ERR_COMMAND;
+            for (size_t side = 0; side < 2; ++side) {
+                const size_t motor_index = coupling.motor_indices[side];
+                const auto &motor = config_.motors[motor_index];
+                const double current_position = motor.polarity *
+                    (NormalizedMotorPosition(motor_index) - motor.zero_offset);
+                // Encode the full joint proportional effort in the native motor target.
+                // Keep damping local to the motor; do not add a host velocity residual.
+                constexpr float kMinimumPositionGain = 1.0e-4f;
+                coupled_position[side] = current_position;
+                if (coupled_kp[side] >= kMinimumPositionGain)
+                    coupled_position[side] += motor_proportional_torque[side] / coupled_kp[side];
+            }
+        }
+        if (split_impedance) {
+            for (size_t side = 0; side < 2; ++side) {
+                const size_t motor_index = coupling.motor_indices[side];
+                coupled_kp[side] = std::min(coupled_kp[side], impedance.motor_kp_max);
+                coupled_kd[side] = std::min(coupled_kd[side], impedance.motor_kd_max);
+                const auto &motor = config_.motors[motor_index];
+                const double current_position = motor.polarity *
+                    (NormalizedMotorPosition(motor_index) - motor.zero_offset);
+                const double current_velocity =
+                    motor.polarity * motor_states_[motor_index].vel;
+                const double hardware_torque =
+                    coupled_kp[side] * (coupled_position[side] - current_position) +
+                    coupled_kd[side] * (coupled_velocity[side] - current_velocity);
+                // The hardware loop and feedforward together reproduce the full joint PD.
+                coupled_torque[side] -= hardware_torque;
+            }
+        }
         for (size_t side = 0; side < 2; ++side) {
             const size_t motor_index = coupling.motor_indices[side];
             position[motor_index] = coupled_position[side];
             velocity[motor_index] = coupled_velocity[side];
             torque[motor_index] = coupled_torque[side];
-            kp[motor_index] = 0.0;
-            kd[motor_index] = 0.0;
+            kp[motor_index] = coupled_kp[side];
+            kd[motor_index] = coupled_kd[side];
             actuation_mode[motor_index] =
                 !damp_mode && command.actuation_mode == WHOLE_BODY_ACTUATION_TORQUE
                 ? MOTOR_MODE_TRQ
@@ -767,6 +967,7 @@ bool WholeBodyCore::ValidateMotorCommands(const std::vector<motor_cmd> &commands
 }
 
 int WholeBodyCore::Write(const whole_body_joint_command &command, double monotonic_time_s) {
+    command_written_since_tick_ = true;
     if (!initialized_) return Fail(WHOLE_BODY_ERR_STATE, "whole-body backend is not initialized");
     if (config_.read_only || !config_.allow_actuation) {
         health_.last_error = WHOLE_BODY_ERR_READ_ONLY;
@@ -792,27 +993,52 @@ int WholeBodyCore::Write(const whole_body_joint_command &command, double monoton
         last_error_ = "motor commands require fresh initial feedback";
         return WHOLE_BODY_ERR_STATE;
     }
+    if (feedback_hold_active_ && command.enable && command.mode != WHOLE_BODY_MODE_POWER_OFF) {
+        const int result = HoldMotorCommand(monotonic_time_s);
+        if (result == WHOLE_BODY_RETRY) last_command_time_s_ = monotonic_time_s;
+        return result;
+    }
     if (command.enable && command.mode != WHOLE_BODY_MODE_POWER_OFF && has_joint_state_ &&
-        !ValidateJointPositions(last_state_, &validation_error)) {
+        (!ValidateJointPositions(last_state_, &validation_error) ||
+            !ValidateMotorFeedback(&validation_error))) {
         return EnterSafety(
             WHOLE_BODY_ERR_STATE, "joint feedback failed validation: " + validation_error);
     }
-    std::vector<motor_cmd> motor_commands;
-    const int build_result = BuildMotorCommands(command, &motor_commands);
+    auto &motor_commands = command_buffer_;
+    const int build_result = BuildMotorCommands(command, &motor_commands, &validation_error);
     if (build_result != WHOLE_BODY_OK)
-        return EnterSafety(build_result, "failed to map joint command to motor space");
-    std::vector<MotorCommandMetrics> command_metrics;
+        return EnterSafety(build_result, validation_error.empty()
+            ? "failed to map joint command to motor space" : validation_error);
+    auto &command_metrics = metrics_buffer_;
     if (!ValidateMotorCommands(
             motor_commands, monotonic_time_s, &command_metrics, &validation_error)) {
         return EnterSafety(WHOLE_BODY_ERR_COMMAND,
             "motor command failed validation: " + validation_error);
     }
-    if (SendMotorCommands(motor_commands, monotonic_time_s, &command_metrics) != WHOLE_BODY_OK)
+    const int send_result = SendMotorCommands(motor_commands, monotonic_time_s, &command_metrics);
+    if (send_result == WHOLE_BODY_ERR_TIMEOUT &&
+        (!command.enable || command.mode == WHOLE_BODY_MODE_POWER_OFF) &&
+        CanTolerateDisabledCommunication(MonotonicTime())) {
+        last_idle_time_s_ = monotonic_time_s;
+        health_.last_error = WHOLE_BODY_RETRY;
+        last_error_ = DescribeWriteFailure("temporary disabled reply timeout; retrying");
+        return WHOLE_BODY_RETRY;
+    }
+    if (send_result == WHOLE_BODY_ERR_TIMEOUT && command.enable &&
+        command.mode != WHOLE_BODY_MODE_POWER_OFF && CanTolerateCommunication(MonotonicTime())) {
+        last_command_time_s_ = monotonic_time_s;
+        health_.last_error = WHOLE_BODY_RETRY;
+        last_error_ = DescribeWriteFailure("temporary motor reply timeout; retrying enabled control");
+        return WHOLE_BODY_RETRY;
+    }
+    if (send_result != WHOLE_BODY_OK)
         return EnterSafety(WHOLE_BODY_ERR_DEVICE, DescribeWriteFailure("failed to write motor commands"));
     mode_ = command.mode;
+    last_joint_command_ = command;
     const bool idle_request = !command.enable || command.mode == WHOLE_BODY_MODE_POWER_OFF;
     if (idle_request) {
         last_idle_time_s_ = monotonic_time_s;
+        feedback_hold_active_ = false;
     }
     has_command_ = !idle_request;
     if (has_command_) last_command_time_s_ = monotonic_time_s;
@@ -844,7 +1070,15 @@ int WholeBodyCore::Write(const whole_body_joint_command &command, double monoton
 int WholeBodyCore::SendMotorCommands(
     const std::vector<motor_cmd> &commands, double monotonic_time_s,
     const std::vector<MotorCommandMetrics> *metrics) {
-    if (devices_->Write(commands) < 0) return WHOLE_BODY_ERR_DEVICE;
+    const double started_at = MonotonicTime();
+    const int result = devices_->Write(commands);
+    last_motor_attempt_time_s_ = MonotonicTime();
+    if (result < 0) {
+        if (!devices_->LastWriteTimedOut()) return WHOLE_BODY_ERR_DEVICE;
+        if (write_timeout_since_s_ < 0.0) write_timeout_since_s_ = started_at;
+        return WHOLE_BODY_ERR_TIMEOUT;
+    }
+    write_timeout_since_s_ = -1.0;
     last_motor_commands_ = commands;
     if (metrics && metrics->size() == commands.size())
         last_motor_command_metrics_ = *metrics;
@@ -855,16 +1089,58 @@ int WholeBodyCore::SendMotorCommands(
     return WHOLE_BODY_OK;
 }
 
+bool WholeBodyCore::CanTolerateCommunication(double now_s) const {
+    return has_command_ && !fault_latched_ && !watchdog_active_ &&
+        FeedbackWithinTolerance(now_s);
+}
+
+bool WholeBodyCore::CanTolerateDisabledCommunication(double now_s) const {
+    return !has_command_ && mode_ == WHOLE_BODY_MODE_POWER_OFF &&
+        !fault_latched_ && !watchdog_active_ && FeedbackWithinTolerance(now_s);
+}
+
+bool WholeBodyCore::FeedbackWithinTolerance(double now_s) const {
+    const double limit = config_.communication_tolerance_s;
+    if (limit <= 0.0 || !has_joint_state_ || !has_motor_command_ ||
+        feedback_status_.motor_received.size() != config_.motors.size() ||
+        feedback_status_.motor_age_s.size() != config_.motors.size()) return false;
+    if (write_timeout_since_s_ >= 0.0 && now_s - write_timeout_since_s_ > limit) return false;
+    const double elapsed = std::max(0.0, now_s - feedback_read_time_s_);
+    const auto recent = [limit, elapsed](bool received, double age) {
+        return received && std::isfinite(age) && age >= 0.0 && age + elapsed <= limit;
+    };
+    if (!recent(feedback_status_.imu_received, feedback_status_.imu_age_s)) return false;
+    for (size_t i = 0; i < config_.motors.size(); ++i) {
+        if (!recent(feedback_status_.motor_received[i], feedback_status_.motor_age_s[i]))
+            return false;
+    }
+    return true;
+}
+
+int WholeBodyCore::HoldMotorCommand(double monotonic_time_s) {
+    if (!CanTolerateCommunication(MonotonicTime()))
+        return EnterSafety(WHOLE_BODY_ERR_TIMEOUT, "communication tolerance expired");
+    // Preserve the last transmitted motor-space target and native gains. Do not
+    // remap a new trajectory or calculate host PD from a stale joint measurement.
+    const int result = SendMotorCommands(last_motor_commands_, monotonic_time_s,
+        &last_motor_command_metrics_);
+    if (result != WHOLE_BODY_OK &&
+        (result != WHOLE_BODY_ERR_TIMEOUT || !CanTolerateCommunication(MonotonicTime())))
+        return EnterSafety(WHOLE_BODY_ERR_DEVICE, DescribeWriteFailure("motor hold failed"));
+    health_.last_error = WHOLE_BODY_RETRY;
+    last_error_ = "temporary communication delay; holding last motor targets";
+    return WHOLE_BODY_RETRY;
+}
+
 int WholeBodyCore::SendIdle() {
-    std::vector<motor_cmd> commands(config_.motors.size());
-    for (auto &command : commands) command.mode = MOTOR_MODE_IDLE;
-    return SendMotorCommands(commands, MonotonicTime());
+    return SendMotorCommands(idle_buffer_, MonotonicTime());
 }
 
 int WholeBodyCore::EnterSafety(int error, const std::string &message) {
     const bool can_write = initialized_ && !config_.read_only && config_.allow_actuation;
     has_command_ = false;
     has_joint_state_ = false;
+    feedback_hold_active_ = false;
     watchdog_active_ = false;
     fault_latched_ = true;
     mode_ = WHOLE_BODY_MODE_SAFETY;
@@ -876,6 +1152,7 @@ int WholeBodyCore::EnterSafety(int error, const std::string &message) {
 }
 
 int WholeBodyCore::Tick(double monotonic_time_s) {
+    const bool command_written = std::exchange(command_written_since_tick_, false);
     if (!initialized_ || !std::isfinite(monotonic_time_s))
         return Fail(WHOLE_BODY_ERR_STATE, "invalid whole-body tick");
     if (config_.read_only || !config_.allow_actuation) return WHOLE_BODY_OK;
@@ -883,13 +1160,36 @@ int WholeBodyCore::Tick(double monotonic_time_s) {
         (mode_ == WHOLE_BODY_MODE_SAFETY && !has_command_);
     if (disabled_mode &&
         monotonic_time_s - last_idle_time_s_ >= config_.cycle_s) {
-        if (SendIdle() != WHOLE_BODY_OK)
+        const int idle_result = SendIdle();
+        if (idle_result == WHOLE_BODY_ERR_TIMEOUT &&
+            CanTolerateDisabledCommunication(MonotonicTime())) {
+            last_idle_time_s_ = monotonic_time_s;
+            health_.last_error = WHOLE_BODY_RETRY;
+            last_error_ = DescribeWriteFailure("temporary disabled reply timeout; retrying");
+            return WHOLE_BODY_RETRY;
+        }
+        if (idle_result != WHOLE_BODY_OK)
             return Fail(WHOLE_BODY_ERR_DEVICE,
                 DescribeWriteFailure("failed to maintain disabled motor state"));
         last_idle_time_s_ = monotonic_time_s;
     }
     if (!has_command_ || watchdog_active_ || fault_latched_ ||
         monotonic_time_s - last_command_time_s_ <= config_.command_timeout_s) {
+        if (has_command_ && !watchdog_active_ && !fault_latched_ &&
+            config_.communication_tolerance_s > 0.0 &&
+            (feedback_hold_active_ || write_timeout_since_s_ >= 0.0) &&
+            MonotonicTime() - last_motor_attempt_time_s_ >= config_.cycle_s)
+            return HoldMotorCommand(monotonic_time_s);
+        if (config_.refresh_last_command && !command_written && has_command_ &&
+            !watchdog_active_ && !fault_latched_ && has_joint_state_ && !feedback_hold_active_) {
+            // Recompute host PD/coupling from fresh feedback, without renewing
+            // the upstream command deadline or extending a stalled controller's lease.
+            const double received_at = last_command_time_s_;
+            const int result = Write(last_joint_command_, monotonic_time_s);
+            last_command_time_s_ = received_at;
+            command_written_since_tick_ = false;
+            return result;
+        }
         return WHOLE_BODY_OK;
     }
     if (SendIdle() != WHOLE_BODY_OK)
@@ -930,8 +1230,10 @@ int WholeBodyCore::SetMode(whole_body_mode mode) {
             DescribeWriteFailure("failed to enter a safe whole-body mode"));
     }
     mode_ = mode;
-    if (mode == WHOLE_BODY_MODE_POWER_OFF || mode == WHOLE_BODY_MODE_SAFETY)
+    if (mode == WHOLE_BODY_MODE_POWER_OFF || mode == WHOLE_BODY_MODE_SAFETY) {
         last_idle_time_s_ = 0.0;
+        feedback_hold_active_ = false;
+    }
     if (mode == WHOLE_BODY_MODE_POWER_OFF) {
         has_command_ = false;
         watchdog_active_ = false;
@@ -1032,6 +1334,9 @@ bool WholeBodyCore::IsNonFatalMotorError(size_t index) const {
 whole_body_health WholeBodyCore::GetHealth() const { return health_; }
 
 bool WholeBodyCore::HasImu() const { return config_.imu.enabled; }
+void WholeBodyCore::GetTransportDiagnostics(whole_body_transport_diagnostics *diagnostics) const {
+    devices_->GetTransportDiagnostics(diagnostics);
+}
 
 void WholeBodyCore::GetDiagnosticsV2(whole_body_diagnostics_v2 *diagnostics) const {
     if (!diagnostics) return;

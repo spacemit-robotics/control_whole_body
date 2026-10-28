@@ -13,7 +13,7 @@
 #include <string>
 #include <vector>
 
-#include "device_manager.h"
+#include "devices/device_manager.h"
 
 namespace {
 
@@ -85,6 +85,24 @@ int main() {
     assert(error == "invalid motor command batch");
     for (const auto &motor : fake_motors) assert(motor.calls == 3);
     assert(whole_body::WriteMotorCommands(config, devices, commands, nullptr, WriteFakeMotor) < 0);
+
+    commands.resize(3);
+    bool timeout_only = true;
+    fake_motors[0] = {-1, ETIMEDOUT, 0};
+    fake_motors[1] = {};
+    fake_motors[2] = {-1, ETIMEDOUT, 0};
+    assert(whole_body::WriteMotorCommands(config, devices, commands, &error,
+        WriteFakeMotor, &timeout_only) < 0);
+    assert(timeout_only);
+    fake_motors[2].system_error = EIO;
+    assert(whole_body::WriteMotorCommands(config, devices, commands, &error,
+        WriteFakeMotor, &timeout_only) < 0);
+    assert(!timeout_only);  // One hard error must not be hidden by other endpoints' timeouts.
+    fake_motors[0] = {};
+    fake_motors[2] = {};
+    assert(whole_body::WriteMotorCommands(config, devices, commands, &error,
+        WriteFakeMotor, &timeout_only) == 0);
+    assert(!timeout_only);
     std::cout << "Motor write diagnostics tests passed\n";
     return 0;
 }

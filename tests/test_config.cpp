@@ -15,9 +15,9 @@
 #include <stdexcept>
 #include <string>
 
-#include "device_manager.h"
+#include "config/whole_body_config.h"
+#include "devices/device_manager.h"
 #include "whole_body.h"
-#include "whole_body_config.h"
 
 namespace {
 
@@ -134,6 +134,7 @@ int main(int argc, char *argv[]) {
     assert(!config.read_only);
     assert(config.allow_actuation);
     assert(config.startup_feedback_timeout_s > config.feedback_timeout_s);
+    assert(config.communication_tolerance_s == 0.0);
     assert(config.require_motor_receive_timestamps);
     assert(config.imu.enabled);
     assert(whole_body_has_imu(nullptr) == WHOLE_BODY_ERR_STATE);

@@ -15,10 +15,10 @@
 #include <unordered_map>
 #include <vector>
 
-#include "device_manager.h"
-#include "parallel_ankle.h"
+#include "config/whole_body_config.h"
+#include "devices/device_manager.h"
+#include "mapping/coupled_mapping.h"
 #include "whole_body.h"
-#include "whole_body_config.h"
 
 namespace whole_body {
 
@@ -36,6 +36,7 @@ class WholeBodyCore {
     whole_body_health GetHealth() const;
     void GetDiagnostics(whole_body_diagnostics *diagnostics) const;
     void GetDiagnosticsV2(whole_body_diagnostics_v2 *diagnostics) const;
+    void GetTransportDiagnostics(whole_body_transport_diagnostics *diagnostics) const;
     void GetMotorCommandDiagnostics(
         whole_body_motor_command_diagnostics *diagnostics) const;
     void GetMotorCommandDiagnosticsV2(
@@ -45,7 +46,7 @@ class WholeBodyCore {
 
     private:
     struct CouplingRuntime {
-        ParallelAnkle mapping;
+        CoupledMapping mapping;
         std::array<size_t, 2> joint_indices;
         std::array<size_t, 2> motor_indices;
         bool metrics_valid = false;
@@ -65,8 +66,10 @@ class WholeBodyCore {
         const whole_body_joint_command &command, std::string *reason) const;
     bool ValidateJointPositions(
         const whole_body_state &state, std::string *reason) const;
+    bool ValidateMotorFeedback(std::string *reason) const;
     int BuildMotorCommands(
-        const whole_body_joint_command &command, std::vector<motor_cmd> *motor_commands);
+        const whole_body_joint_command &command, std::vector<motor_cmd> *motor_commands,
+        std::string *reason);
     bool ValidateMotorCommands(const std::vector<motor_cmd> &commands,
         double monotonic_time_s, std::vector<MotorCommandMetrics> *metrics,
         std::string *reason) const;
@@ -74,6 +77,10 @@ class WholeBodyCore {
         const std::vector<motor_cmd> &commands, double monotonic_time_s,
         const std::vector<MotorCommandMetrics> *metrics = nullptr);
     int SendIdle();
+    bool CanTolerateCommunication(double now_s) const;
+    bool CanTolerateDisabledCommunication(double now_s) const;
+    bool FeedbackWithinTolerance(double now_s) const;
+    int HoldMotorCommand(double monotonic_time_s);
     int EnterSafety(int error, const std::string &message);
     std::string DescribeFeedbackProblem(const std::string &prefix) const;
     std::string DescribeMotorErrors() const;
@@ -82,13 +89,20 @@ class WholeBodyCore {
     uint32_t FatalMotorError(size_t index) const;
     void UpdateMotorPositionBranches();
     double NormalizedMotorPosition(size_t index) const;
+    void UpdateDampingVelocity(size_t joint_index, double velocity);
 
     RuntimeConfig config_;
     std::unique_ptr<DeviceManager> devices_;
     std::unordered_map<std::string, size_t> motor_indices_;
     std::unordered_map<std::string, size_t> joint_indices_;
+    std::vector<size_t> imu_chain_indices_;
+    std::vector<double> imu_chain_positions_;
+    std::vector<double> imu_chain_velocities_;
     std::vector<CouplingRuntime> couplings_;
     std::vector<motor_state> motor_states_;
+    std::vector<double> motor_position_buffer_, motor_velocity_buffer_, motor_torque_buffer_;
+    std::vector<motor_cmd> command_buffer_, idle_buffer_;
+    std::vector<MotorCommandMetrics> metrics_buffer_;
     std::vector<double> motor_position_branch_offsets_;
     std::vector<double> previous_motor_raw_positions_;
     std::vector<bool> motor_position_branch_initialized_;
@@ -96,16 +110,24 @@ class WholeBodyCore {
     std::vector<MotorCommandMetrics> last_motor_command_metrics_;
     std::vector<double> joint_position_;
     std::vector<double> joint_velocity_;
+    std::vector<double> damping_velocity_;
+    std::vector<double> damping_timestamp_s_;
     std::vector<std::array<double, 2>> reference_position_limits_;
     DeviceFeedbackStatus feedback_status_;
     imu_data imu_state_{};
     whole_body_state last_state_{};
+    whole_body_joint_command last_joint_command_{};
+    bool command_written_since_tick_ = false;
     whole_body_health health_{};
     whole_body_mode mode_ = WHOLE_BODY_MODE_POWER_OFF;
     std::string last_error_;
     double last_command_time_s_ = 0.0;
     double last_idle_time_s_ = 0.0;
     double last_motor_command_time_s_ = 0.0;
+    double last_motor_attempt_time_s_ = 0.0;
+    double feedback_read_time_s_ = 0.0;
+    double write_timeout_since_s_ = -1.0;
+    bool feedback_hold_active_ = false;
     bool initialized_ = false;
     bool has_command_ = false;
     bool has_joint_state_ = false;
