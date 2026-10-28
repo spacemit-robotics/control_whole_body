@@ -537,7 +537,7 @@ RuntimeConfig LoadConfig(const std::string &main_config_path) {
                 "motor_bias", "motor_limit", "ankle_limit", "motor_difference_limit",
                 "max_iterations", "squared_tolerance", "jacobian_condition_limit",
                 "torque_amplification_limit", "table_file", "table_direction",
-                "table_output_scale", "table_interpolation"},
+                "table_output_scale", "table_interpolation", "table_triangles_file"},
             path);
         CouplingConfig coupling;
         coupling.type = Required<std::string>(couplings[i], "type", path);
@@ -549,7 +549,8 @@ RuntimeConfig LoadConfig(const std::string &main_config_path) {
             throw std::runtime_error(path + " requires two distinct joints and motors");
         if (coupling.type == "parallel_ankle") {
             if (couplings[i]["table_file"] || couplings[i]["table_direction"] ||
-                couplings[i]["table_output_scale"] || couplings[i]["table_interpolation"])
+                couplings[i]["table_output_scale"] || couplings[i]["table_interpolation"] ||
+                couplings[i]["table_triangles_file"])
                 throw std::runtime_error(path + " geometry cannot specify table_file");
             const YAML::Node pivots = couplings[i]["ankle_pivots"];
             const YAML::Node balls = couplings[i]["ball_positions"];
@@ -577,6 +578,12 @@ RuntimeConfig LoadConfig(const std::string &main_config_path) {
                     couplings[i], "table_interpolation", path);
             if (coupling.table_interpolation != "bilinear" && coupling.table_interpolation != "delaunay")
                 throw std::runtime_error(path + ".table_interpolation is unsupported");
+            if (couplings[i]["table_triangles_file"]) {
+                const auto mesh = Required<std::string>(couplings[i], "table_triangles_file", path);
+                if (mesh.empty() || coupling.table_interpolation != "delaunay")
+                    throw std::runtime_error(path + ".table_triangles_file requires delaunay and a path");
+                coupling.table_triangles_file = ResolvePath(ParentPath(config.hardware_config_path), mesh);
+            }
             if (coupling.table_direction != "joint_to_motor" &&
                 coupling.table_direction != "motor_to_joint")
                 throw std::runtime_error(path + ".table_direction is unsupported");

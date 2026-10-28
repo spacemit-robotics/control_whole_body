@@ -278,6 +278,41 @@ int main(int argc, char **argv) {
     const auto derivative = jacobian;
     assert(curved.JointToMotor({0.74, 0.20}, &motor, &jacobian));
     for (size_t i = 0; i < 4; ++i) assert(std::abs(jacobian[i] - derivative[i]) < 1e-12);
+
+    // Fixed topology has reproducible derivatives at the diagonal and corners.
+    // z0 = 2*x+2*y on lower triangle; 3*x+y on upper triangle.
+    const std::string mesh_path = std::string(path) + ".triangles";
+    { std::ofstream mesh(mesh_path); mesh << "ordered_triangles_v1 4 2\n0,1,3\n0,3,2\n"; }
+    config.table_triangles_file = mesh_path;
+    whole_body::CoupledMapping fixed(config);
+    assert(fixed.JointToMotor({0.25, 0.25}, &motor, &jacobian));
+    assert(std::abs(motor[0] - 1.0) < 1e-12);
+    assert(std::abs(jacobian[0] - 3.0) < 1e-12 && std::abs(jacobian[1] - 1.0) < 1e-12);
+    assert(fixed.JointToMotor({0, 0}, &motor, &jacobian));
+    assert(std::abs(jacobian[0] - 3.0) < 1e-12);
+    assert(fixed.JointToMotor({0.73, 0.19}, &motor, &jacobian));
+    assert(std::abs(jacobian[0] - 2.0) < 1e-12 && std::abs(jacobian[1] - 2.0) < 1e-12);
+    assert(fixed.MotorToJoint(motor, &recovered));
+    assert(std::abs(recovered[0] - 0.73) < 1e-6 && std::abs(recovered[1] - 0.19) < 1e-6);
+    // Reordering triangles changes only the derivative on the shared edge.
+    { std::ofstream mesh(mesh_path); mesh << "ordered_triangles_v1 4 2\n0,3,2\n0,1,3\n"; }
+    whole_body::CoupledMapping reversed_order(config);
+    assert(reversed_order.JointToMotor({0.25, 0.25}, &motor, &jacobian));
+    assert(std::abs(motor[0] - 1.0) < 1e-12);
+    assert(std::abs(jacobian[0] - 2.0) < 1e-12 && std::abs(jacobian[1] - 2.0) < 1e-12);
+    // Fail during initialization, never silently fall back to retriangulation.
+    for (const char *bad : {"ordered_triangles_v1 5 2\n0,1,3\n0,3,2\n",
+            "ordered_triangles_v1 4 2\n0,1,3\n0,1,3\n",
+            "ordered_triangles_v1 4 2\n0,1,4\n0,3,2\n",
+            "ordered_triangles_v1 4 2\n0,1,3\n", "ordered_triangles_v1 4 1\n0,1,3\n"}) {
+        { std::ofstream mesh(mesh_path); mesh << bad; }
+        rejected = false;
+        try { whole_body::CoupledMapping invalid(config); }
+        catch (const std::runtime_error &) { rejected = true; }
+        assert(rejected);
+    }
+    config.table_triangles_file.clear();
+    unlink(mesh_path.c_str());
     MakeTable(path, true);
     whole_body::CoupledMapping triangular_hole(config);
     assert(!triangular_hole.JointToMotor({0.2, 0.2}, &motor));

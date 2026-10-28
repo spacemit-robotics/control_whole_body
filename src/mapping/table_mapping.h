@@ -9,15 +9,19 @@
 #define TABLE_MAPPING_H
 
 #include <array>
+#include <memory>
 #include <vector>
 
 #include "config/whole_body_config.h"
 
 namespace whole_body {
 
+class TriangleTable;
+
 class TableMapping {
     public:
     explicit TableMapping(const CouplingConfig &config);
+    ~TableMapping();
     bool JointToMotor(const std::array<double, 2> &joint, std::array<double, 2> *motor,
         std::array<double, 4> *jacobian = nullptr, bool allow_global_search = true) const;
     bool MotorToJoint(const std::array<double, 2> &motor, std::array<double, 2> *joint,
@@ -25,6 +29,8 @@ class TableMapping {
 
     private:
     bool Lookup(const std::array<double, 2> &joint, std::array<double, 2> *motor,
+        std::array<double, 4> *jacobian) const;
+    bool LookupGrid(const std::array<double, 2> &joint, std::array<double, 2> *motor,
         std::array<double, 4> *jacobian) const;
     bool InverseLookup(const std::array<double, 2> &value, std::array<double, 2> *input,
         std::array<double, 4> *jacobian, bool allow_global_search = true) const;
@@ -40,6 +46,7 @@ class TableMapping {
     std::vector<std::array<double, 2>> values_;
     // Per cell: 0 = unsupported, 1 = lower-left/upper-right, 2 = other diagonal.
     std::vector<uint8_t> diagonals_;
+    std::unique_ptr<TriangleTable> mesh_;
     mutable std::array<double, 2> last_joint_{};
     mutable bool has_last_joint_ = false;
     bool motor_to_joint_ = false;
