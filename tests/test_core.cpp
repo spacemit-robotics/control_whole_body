@@ -702,6 +702,65 @@ void TestStartupTimeoutRecovery() {
     }
 }
 
+void TestInitialIdleRetries() {
+    auto devices = std::make_unique<DummyDevices>();
+    auto *fake = devices.get();
+    fake->write_failures = {"first disabled reply timeout", "second disabled reply timeout"};
+    fake->write_timeouts = {true, true};
+    whole_body::WholeBodyCore core(MakeConfig(false), std::move(devices));
+    assert(core.Init() == WHOLE_BODY_OK);
+    whole_body_state state{};
+    // Even good sensor packets do not authorize actuation before IDLE is confirmed.
+    assert(core.Read(&state) == WHOLE_BODY_ERR_STATE);
+    assert(core.GetHealth().state == WHOLE_BODY_HEALTH_CREATED);
+    assert(core.Write(MakeCommand(), Now()) == WHOLE_BODY_ERR_STATE);
+    assert(core.Tick(Now()) == WHOLE_BODY_RETRY);
+    assert(fake->write_count == 2);
+    for (const auto &command : fake->last_commands) assert(command.mode == MOTOR_MODE_IDLE);
+    assert(core.Tick(Now() + 0.01) == WHOLE_BODY_OK);
+    assert(core.Read(&state) == WHOLE_BODY_OK);
+    assert(core.GetHealth().state == WHOLE_BODY_HEALTH_READY);
+    assert(core.Write(MakeCommand(), Now()) == WHOLE_BODY_OK);
+
+    auto expired_devices = std::make_unique<DummyDevices>();
+    expired_devices->write_failures = {"timeout", "timeout"};
+    expired_devices->write_timeouts = {true, true};
+    auto config = MakeConfig(false);
+    config.startup_feedback_timeout_s = 0.001;
+    whole_body::WholeBodyCore expired(config, std::move(expired_devices));
+    assert(expired.Init() == WHOLE_BODY_OK);
+    std::this_thread::sleep_for(std::chrono::milliseconds(2));
+    assert(expired.Tick(Now()) == WHOLE_BODY_ERR_DEVICE);
+    assert(expired.Read(&state) < 0);
+    assert(expired.GetHealth().state == WHOLE_BODY_HEALTH_ERROR);
+}
+
+void TestInitialMappingReadiness() {
+    auto devices = std::make_unique<DummyDevices>();
+    auto *fake = devices.get();
+    fake->feedback[0].pos = 10.0f;
+    auto config = MakeParallelConfig();
+    whole_body::WholeBodyCore core(config, std::move(devices));
+    assert(core.Init() == WHOLE_BODY_OK);
+    whole_body_state state{};
+    assert(core.Read(&state) == WHOLE_BODY_ERR_STATE);
+    assert(core.GetHealth().state == WHOLE_BODY_HEALTH_CREATED);
+    assert(core.LastError().find("motor_0 raw=10") != std::string::npos);
+    assert(core.LastError().find("joint_0/joint_1") != std::string::npos);
+    assert(core.Write(MakeCommand(), Now()) == WHOLE_BODY_ERR_STATE);
+    assert(fake->last_commands[0].mode == MOTOR_MODE_IDLE);
+    std::array<double, 2> position{};
+    whole_body::CoupledMapping mapping(config.couplings[0]);
+    assert(mapping.JointToMotor({0.0, 0.0}, &position));
+    for (size_t i = 0; i < 2; ++i) fake->feedback[i].pos = static_cast<float>(position[i]);
+    assert(core.Read(&state) == WHOLE_BODY_OK);
+    assert(core.GetHealth().state == WHOLE_BODY_HEALTH_READY);
+    // Once ready, real mapping failures still latch; no automatic rearming.
+    fake->feedback[0].pos = 10.0f;
+    assert(core.Read(&state) == WHOLE_BODY_ERR_STATE);
+    assert(core.GetHealth().state == WHOLE_BODY_HEALTH_ERROR);
+}
+
 void TestPeriodicMotorPosition() {
     constexpr double kTwoPi = 6.283185307179586;
     constexpr double kZeroOffset = -2.0586329;
@@ -854,6 +913,34 @@ void TestFeedbackPositionPolicy() {
             for (const auto &sent : fake->last_commands) assert(sent.mode == MOTOR_MODE_IDLE);
         }
     }
+}
+
+void TestDampOutsidePositionEnvelope() {
+    auto config = MakeConfig(false);
+    config.joints[1].position_limit = {-1.972222054, 1.972222054};
+    auto devices = std::make_unique<DummyDevices>();
+    auto *fake = devices.get();
+    fake->feedback[1].pos = static_cast<float>(1.98409 + config.motors[1].zero_offset);
+    whole_body::WholeBodyCore core(config, std::move(devices));
+    assert(core.Init() == WHOLE_BODY_OK);
+    whole_body_state state{};
+    assert(core.Read(&state) == WHOLE_BODY_OK);
+    auto command = MakeCommand();
+    command.mode = WHOLE_BODY_MODE_DAMP;
+    assert(core.Write(command, Now()) == WHOLE_BODY_OK);
+    for (int sample = 0; sample < 10; ++sample) {
+        assert(core.Read(&state) == WHOLE_BODY_OK);
+        assert(state.position[1] > config.joints[1].position_limit[1]);
+        assert(core.Write(command, Now()) == WHOLE_BODY_OK);
+        for (const auto &motor : fake->last_commands) {
+            assert(motor.mode == MOTOR_MODE_HYBRID && motor.kp == 0.0f);
+            assert(motor.vel_des == 0.0f && motor.trq_des == 0.0f && motor.kd > 0.0f);
+        }
+    }
+    // This exception applies only to passive damping, not position control.
+    command.mode = WHOLE_BODY_MODE_RL;
+    assert(core.Write(command, Now()) == WHOLE_BODY_ERR_STATE);
+    assert(fake->last_commands[1].mode == MOTOR_MODE_IDLE);
 }
 
 void TestNativeCoupledImpedance() {
@@ -1053,9 +1140,12 @@ int main() {
     TestNativeCoupledImpedance();
     TestProjectedCoupledImpedance();
     TestFeedbackPositionPolicy();
+    TestDampOutsidePositionEnvelope();
     TestMeasuredVelocityGuard();
     TestStartupFeedbackGate();
     TestStartupTimeoutRecovery();
+    TestInitialIdleRetries();
+    TestInitialMappingReadiness();
     TestPartialStartupFaults();
     TestPeriodicMotorPosition();
     auto devices = std::make_unique<DummyDevices>();
