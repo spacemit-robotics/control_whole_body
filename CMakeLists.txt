@@ -38,6 +38,7 @@ add_library(whole_body SHARED
     src/mapping/coupled_mapping.cpp
     src/mapping/parallel_ankle.cpp
     src/mapping/table_mapping.cpp
+    src/mapping/triangle_table.cpp
 )
 
 target_include_directories(whole_body

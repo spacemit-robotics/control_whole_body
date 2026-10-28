@@ -39,6 +39,8 @@ int main(void) {
     const std::string hardware_path = std::string(directory) + "/hardware.yaml";
     const std::string table_path = std::string(directory) + "/local.csv";
     { std::ofstream placeholder(table_path); assert(placeholder.good()); }
+    const std::string mesh_path = std::string(directory) + "/ordered_triangles.csv";
+    { std::ofstream placeholder(mesh_path); assert(placeholder.good()); }
     auto main = YAML::LoadFile(std::string(TEST_DATA_DIR) + "/main.yaml");
     auto hardware = YAML::LoadFile(std::string(TEST_DATA_DIR) + "/hardware.yaml");
     main["whole_body"]["config_file"] = "hardware.yaml";
@@ -116,6 +118,19 @@ int main(void) {
     assert(projected.joints[0].impedance.motor_kd_max == 25.0);
     assert(!projected.joints[0].feedback_position_check);
     assert(projected.couplings[0].table_interpolation == "delaunay");
+    root["couplings"][0]["table_triangles_file"] = "ordered_triangles.csv";
+    WriteYaml(hardware_path, hardware);
+    assert(whole_body::LoadConfig(main_path).couplings[0].table_triangles_file ==
+        std::string(directory) + "/ordered_triangles.csv");
+    root["couplings"][0]["table_triangles_file"] = "";
+    WriteYaml(hardware_path, hardware);
+    assert(Rejected(main_path));
+    root["couplings"][0]["table_triangles_file"] = "ordered_triangles.csv";
+    root["couplings"][0]["table_interpolation"] = "bilinear";
+    WriteYaml(hardware_path, hardware);
+    assert(Rejected(main_path));
+    root["couplings"][0].remove("table_triangles_file");
+    root["couplings"][0]["table_interpolation"] = "delaunay";
     root["joints"][0]["impedance"]["motor_kp_max"] = -1.0;
     WriteYaml(hardware_path, hardware);
     assert(Rejected(main_path));
@@ -163,6 +178,7 @@ int main(void) {
     unlink(main_path.c_str());
     unlink(hardware_path.c_str());
     unlink(table_path.c_str());
+    unlink(mesh_path.c_str());
     rmdir(directory);
     return 0;
 }
