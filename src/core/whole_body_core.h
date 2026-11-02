@@ -77,6 +77,8 @@ class WholeBodyCore {
         const std::vector<motor_cmd> &commands, double monotonic_time_s,
         const std::vector<MotorCommandMetrics> *metrics = nullptr);
     int SendIdle();
+    bool CanRetryInitialIdle(double now_s) const;
+    int WaitForInitialState(int error, const std::string &reason);
     bool CanTolerateCommunication(double now_s) const;
     bool CanTolerateDisabledCommunication(double now_s) const;
     bool FeedbackWithinTolerance(double now_s) const;
@@ -127,6 +129,8 @@ class WholeBodyCore {
     double last_motor_attempt_time_s_ = 0.0;
     double feedback_read_time_s_ = 0.0;
     double write_timeout_since_s_ = -1.0;
+    double startup_time_s_ = 0.0;
+    bool startup_ready_ = false;
     bool feedback_hold_active_ = false;
     bool initialized_ = false;
     bool has_command_ = false;

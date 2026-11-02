@@ -53,6 +53,13 @@ CSV 无表头，四列为 `input_0,input_1,output_0,output_1`，角度单位 rad
 电机位置目标使用缓存和零点两次求解尝试，不扫描整张表。失败会报告错误并进入安全处理，
 因此求解失败也可能是局部未收敛，需要结合输入和映射有效域排查。
 
+`table_interpolation: delaunay` 可配合 `table_triangles_file` 加载固定三角网格。
+路径相对硬件 YAML 解析。文件首行为 `ordered_triangles_v1 <点数> <三角形数>`，
+后续每行 `i,j,k` 是原 CSV 行号，从 0 开始。共享边和顶点优先选取文件中靠前的
+三角形，保持跨平台一致的插值和导数；CSV 的行序、输出符号与网格必须配套。
+文件缺失、索引越界、重复或重叠三角形、单格不完整会拒绝加载，不回退重新剖分。
+运行期只查询所在格及相邻格，不分配内存。未配置时保持自动剖分行为。
+
 ## 阻抗方式
 
 `impedance.mode` 决定 PD 在主机还是电机执行：
@@ -128,6 +135,7 @@ DAMP、纯速度、纯力矩模式不检查未使用的位置目标。
 | `coupled_mapping.*` | 统一耦合接口、速度/力矩及增益转换 |
 | `parallel_ankle.*` | 并联连杆几何正反解与雅可比 |
 | `table_mapping.*` | CSV 加载、插值和反向求解 |
+| `triangle_table.*` | 有序三角网格加载、边界选片和三角平面计算 |
 
 回归测试见 [test_parallel_ankle.cpp](../../tests/test_parallel_ankle.cpp) 和
 [test_table_mapping.cpp](../../tests/test_table_mapping.cpp)。

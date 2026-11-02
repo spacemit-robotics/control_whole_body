@@ -18,6 +18,7 @@
 #include <string>
 
 #include <delaunator-cpp.hpp>
+#include "mapping/triangle_table.h"
 
 namespace whole_body {
 namespace {
@@ -131,7 +132,11 @@ TableMapping::TableMapping(const CouplingConfig &config) : config_(config) {
         seen[index] = true;
         values_[index] = {row[2], row[3]};
     }
-    if (config.table_interpolation == "delaunay") {
+    if (!config.table_triangles_file.empty()) {
+        if (config.table_interpolation != "delaunay")
+            throw std::runtime_error("triangle asset requires delaunay interpolation");
+        mesh_ = std::make_unique<TriangleTable>(config.table_triangles_file, rows, xs, ys);
+    } else if (config.table_interpolation == "delaunay") {
         // Preserve CSV point order: co-circular grid points can admit either diagonal.
         std::vector<double> coordinates;
         std::vector<std::array<size_t, 2>> grid_indices;
@@ -166,6 +171,8 @@ TableMapping::TableMapping(const CouplingConfig &config) : config_(config) {
         throw std::runtime_error("invalid table solver limits");
 }
 
+TableMapping::~TableMapping() = default;
+
 bool TableMapping::Lookup(const std::array<double, 2> &joint, std::array<double, 2> *motor,
     std::array<double, 4> *jacobian) const {
     const double input_limit = motor_to_joint_ ? config_.motor_limit : config_.ankle_limit;
@@ -175,6 +182,23 @@ bool TableMapping::Lookup(const std::array<double, 2> &joint, std::array<double,
         joint[0] < x0_ || joint[1] < y0_ ||
         joint[0] > x0_ + step_x_ * (nx_ - 1) || joint[1] > y0_ + step_y_ * (ny_ - 1))
         return false;
+    std::array<double, 2> result;
+    std::array<double, 4> derivative;
+    if (mesh_ ? !mesh_->Lookup(joint, &result, &derivative) : !LookupGrid(joint, &result, &derivative))
+        return false;
+    const double output_limit = motor_to_joint_ ? config_.ankle_limit : config_.motor_limit;
+    if (!FinitePair(result) || std::abs(result[0]) > output_limit ||
+        std::abs(result[1]) > output_limit ||
+        (!motor_to_joint_ && std::abs(result[0] - result[1]) > config_.motor_difference_limit))
+        return false;
+    for (double value : derivative) if (!std::isfinite(value)) return false;
+    *motor = result;
+    if (jacobian) *jacobian = derivative;
+    return true;
+}
+
+bool TableMapping::LookupGrid(const std::array<double, 2> &joint, std::array<double, 2> *motor,
+    std::array<double, 4> *jacobian) const {
     const double gx = (joint[0] - x0_) / step_x_;
     const double gy = (joint[1] - y0_) / step_y_;
     const size_t ix = std::min(static_cast<size_t>(gx), nx_ - 2);
@@ -213,12 +237,6 @@ bool TableMapping::Lookup(const std::array<double, 2> &joint, std::array<double,
             derivative[side * 2 + 1] = dy / step_y_;
         }
     }
-    const double output_limit = motor_to_joint_ ? config_.ankle_limit : config_.motor_limit;
-    if (!FinitePair(result) || std::abs(result[0]) > output_limit ||
-        std::abs(result[1]) > output_limit ||
-        (!motor_to_joint_ && std::abs(result[0] - result[1]) > config_.motor_difference_limit))
-        return false;
-    for (double value : derivative) if (!std::isfinite(value)) return false;
     *motor = result;
     if (jacobian) *jacobian = derivative;
     return true;

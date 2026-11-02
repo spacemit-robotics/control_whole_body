@@ -222,11 +222,17 @@ int WholeBodyCore::Init() {
     std::fill(motor_position_branch_initialized_.begin(),
         motor_position_branch_initialized_.end(), false);
     initialized_ = true;
-    if (!config_.read_only && config_.allow_actuation && SendIdle() != WHOLE_BODY_OK) {
-        const std::string message = DescribeWriteFailure("failed to establish disabled startup state");
-        devices_->Shutdown();
-        initialized_ = false;
-        return Fail(WHOLE_BODY_ERR_DEVICE, message);
+    startup_time_s_ = MonotonicTime();
+    startup_ready_ = false;
+    has_motor_command_ = false;
+    if (!config_.read_only && config_.allow_actuation) {
+        const int result = SendIdle();
+        if (result != WHOLE_BODY_OK && result != WHOLE_BODY_ERR_TIMEOUT) {
+            const std::string message = DescribeWriteFailure("failed to establish disabled startup state");
+            devices_->Shutdown();
+            initialized_ = false;
+            return Fail(WHOLE_BODY_ERR_DEVICE, message);
+        }
     }
     mode_ = WHOLE_BODY_MODE_POWER_OFF;
     has_command_ = false;
@@ -327,13 +333,8 @@ int WholeBodyCore::Read(whole_body_state *state) {
         return EnterSafety(WHOLE_BODY_ERR_STATE,
             "motor or IMU feedback contains non-finite data");
     if (read_result == DEVICE_READ_WAITING) {
-        has_joint_state_ = false;
-        if (!fault_latched_) {
-            health_.last_error = WHOLE_BODY_OK;
-            health_.state = WHOLE_BODY_HEALTH_CREATED;
-            last_error_ = DescribeFeedbackProblem("waiting for initial feedback");
-        }
-        return WHOLE_BODY_ERR_STATE;
+        return WaitForInitialState(WHOLE_BODY_ERR_TIMEOUT,
+            DescribeFeedbackProblem("waiting for initial feedback"));
     }
     if (read_result == DEVICE_READ_INCOMPATIBLE) {
         return EnterSafety(WHOLE_BODY_ERR_CONFIG,
@@ -358,6 +359,9 @@ int WholeBodyCore::Read(whole_body_state *state) {
             DescribeFeedbackProblem("feedback timed out"));
     }
     feedback_hold_active_ = false;
+    if (!config_.read_only && config_.allow_actuation && !has_motor_command_)
+        return WaitForInitialState(WHOLE_BODY_ERR_TIMEOUT,
+            DescribeWriteFailure("initial disabled handshake has not completed"));
     UpdateMotorPositionBranches();
 
     std::memset(state, 0, sizeof(*state));
@@ -407,14 +411,23 @@ int WholeBodyCore::Read(whole_body_state *state) {
                 joint_position, coupled_motor_velocity, &joint_velocity) ||
             !coupling.mapping.MotorTorqueToJoint(
                 joint_position, coupled_motor_torque, &joint_torque)) {
-            return EnterSafety(
-                WHOLE_BODY_ERR_STATE, "coupled joint feedback is outside its solvable domain");
+            std::ostringstream message;
+            message << "coupled joint feedback is outside its solvable domain: "
+                    << config_.joints[coupling.joint_indices[0]].name << "/"
+                    << config_.joints[coupling.joint_indices[1]].name;
+            for (size_t side = 0; side < 2; ++side) {
+                const size_t index = coupling.motor_indices[side];
+                message << " " << config_.motors[index].name << " raw=" << motor_states_[index].pos
+                        << " calibrated=" << coupled_motor_position[side];
+            }
+            return WaitForInitialState(WHOLE_BODY_ERR_STATE, message.str());
         }
         coupling.metrics_valid = coupling.mapping.Metrics(joint_position,
             &coupling.jacobian_condition, &coupling.torque_amplification);
         if (!coupling.metrics_valid) {
-            return EnterSafety(
-                WHOLE_BODY_ERR_STATE, "coupling Jacobian is singular");
+            return WaitForInitialState(WHOLE_BODY_ERR_STATE, "coupling Jacobian is singular: " +
+                config_.joints[coupling.joint_indices[0]].name + "/" +
+                config_.joints[coupling.joint_indices[1]].name);
         }
         const auto &coupling_config = coupling.mapping.Config();
         if ((coupling_config.jacobian_condition_limit > 0.0 &&
@@ -438,7 +451,7 @@ int WholeBodyCore::Read(whole_body_state *state) {
         }
     }
 
-    if (has_command_) {
+    if (has_command_ && mode_ != WHOLE_BODY_MODE_DAMP) {
         std::string reason;
         if (!ValidateJointPositions(*state, &reason))
             return EnterSafety(WHOLE_BODY_ERR_STATE, reason);
@@ -469,6 +482,7 @@ int WholeBodyCore::Read(whole_body_state *state) {
         UpdateDampingVelocity(i, state->velocity[i]);
     }
     has_joint_state_ = true;
+    startup_ready_ = true;
     last_state_ = *state;
     ++health_.read_cycles;
     if (!watchdog_active_ && !fault_latched_) {
@@ -999,7 +1013,8 @@ int WholeBodyCore::Write(const whole_body_joint_command &command, double monoton
         return result;
     }
     if (command.enable && command.mode != WHOLE_BODY_MODE_POWER_OFF && has_joint_state_ &&
-        (!ValidateJointPositions(last_state_, &validation_error) ||
+        ((command.mode != WHOLE_BODY_MODE_DAMP &&
+            !ValidateJointPositions(last_state_, &validation_error)) ||
             !ValidateMotorFeedback(&validation_error))) {
         return EnterSafety(
             WHOLE_BODY_ERR_STATE, "joint feedback failed validation: " + validation_error);
@@ -1018,7 +1033,7 @@ int WholeBodyCore::Write(const whole_body_joint_command &command, double monoton
     const int send_result = SendMotorCommands(motor_commands, monotonic_time_s, &command_metrics);
     if (send_result == WHOLE_BODY_ERR_TIMEOUT &&
         (!command.enable || command.mode == WHOLE_BODY_MODE_POWER_OFF) &&
-        CanTolerateDisabledCommunication(MonotonicTime())) {
+        (CanRetryInitialIdle(MonotonicTime()) || CanTolerateDisabledCommunication(MonotonicTime()))) {
         last_idle_time_s_ = monotonic_time_s;
         health_.last_error = WHOLE_BODY_RETRY;
         last_error_ = DescribeWriteFailure("temporary disabled reply timeout; retrying");
@@ -1136,6 +1151,21 @@ int WholeBodyCore::SendIdle() {
     return SendMotorCommands(idle_buffer_, MonotonicTime());
 }
 
+bool WholeBodyCore::CanRetryInitialIdle(double now_s) const {
+    return !startup_ready_ && !has_command_ && mode_ == WHOLE_BODY_MODE_POWER_OFF &&
+        !fault_latched_ && !watchdog_active_ &&
+        now_s - startup_time_s_ <= config_.startup_feedback_timeout_s;
+}
+
+int WholeBodyCore::WaitForInitialState(int error, const std::string &reason) {
+    if (!CanRetryInitialIdle(MonotonicTime())) return EnterSafety(error, reason);
+    has_joint_state_ = false;
+    health_.last_error = WHOLE_BODY_OK;
+    health_.state = WHOLE_BODY_HEALTH_CREATED;
+    last_error_ = "waiting for initial feedback: " + reason;
+    return WHOLE_BODY_ERR_STATE;
+}
+
 int WholeBodyCore::EnterSafety(int error, const std::string &message) {
     const bool can_write = initialized_ && !config_.read_only && config_.allow_actuation;
     has_command_ = false;
@@ -1162,7 +1192,7 @@ int WholeBodyCore::Tick(double monotonic_time_s) {
         monotonic_time_s - last_idle_time_s_ >= config_.cycle_s) {
         const int idle_result = SendIdle();
         if (idle_result == WHOLE_BODY_ERR_TIMEOUT &&
-            CanTolerateDisabledCommunication(MonotonicTime())) {
+            (CanRetryInitialIdle(MonotonicTime()) || CanTolerateDisabledCommunication(MonotonicTime()))) {
             last_idle_time_s_ = monotonic_time_s;
             health_.last_error = WHOLE_BODY_RETRY;
             last_error_ = DescribeWriteFailure("temporary disabled reply timeout; retrying");

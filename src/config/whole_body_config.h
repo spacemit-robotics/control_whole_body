@@ -93,6 +93,7 @@ struct Vec3 {
 struct CouplingConfig {
     std::string type = "parallel_ankle";
     std::string table_file;
+    std::string table_triangles_file;
     std::string table_direction = "joint_to_motor";
     std::string table_interpolation = "bilinear";
     std::array<double, 2> table_output_scale{1.0, 1.0};
