@@ -94,8 +94,10 @@ bool TriangleTable::Contains(uint32_t triangle, const std::array<double, 2> &poi
         const double dx = q[0] - p[0], dy = q[1] - p[1];
         const double px = point[0] - p[0], py = point[1] - p[1];
         const double cross = std::fma(dx, py, -dy * px);
-        const double tolerance = std::numeric_limits<double>::epsilon() *
-            std::max({std::abs(dx), std::abs(dy), std::abs(px), std::abs(py), 1.0});
+        // The determinant has area units: scale its round-off bound with the
+        // products, so shrinking a cell does not make its entire area an edge.
+        const double tolerance = 4.0 * std::numeric_limits<double>::epsilon() *
+            (std::abs(dx * py) + std::abs(dy * px));
         if (std::abs(cross) <= tolerance) continue;
         const int current = cross > 0 ? 1 : -1;
         if (sign != 0 && sign != current) return false;

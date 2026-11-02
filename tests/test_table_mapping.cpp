@@ -7,7 +7,9 @@
  */
 #include "core/whole_body_core.h"
 #include "mapping/coupled_mapping.h"
+#include "mapping/triangle_table.h"
 
+#include <algorithm>
 #include <array>
 #include <cassert>
 #include <cmath>
@@ -18,6 +20,7 @@
 #include <stdexcept>
 #include <string>
 #include <utility>
+#include <vector>
 #include <unistd.h>
 
 namespace {
@@ -39,6 +42,51 @@ void MakeTable(const std::string &path, bool hole, bool singular = false,
 
 double Dot(const std::array<double, 2> &a, const std::array<double, 2> &b) {
     return a[0] * b[0] + a[1] * b[1];
+}
+
+void TestTriangleScales(const std::string &path) {
+    for (double scale : {1.0, 1e-3, 1e-8, 1e-12}) {
+        for (double aspect : {1.0, 1e-3, 1e3}) {
+            const double height = scale * aspect;
+            const std::vector<std::array<double, 4>> rows{
+                {0, 0, 0, 0}, {scale, 0, 0, 0}, {0, height, 0, 0},
+                {scale, height, scale, scale}};
+            for (bool reverse_order : {false, true}) {
+                for (bool clockwise : {false, true}) {
+                    const char *lower = clockwise ? "0,3,1\n" : "0,1,3\n";
+                    const char *upper = clockwise ? "0,2,3\n" : "0,3,2\n";
+                    {
+                        std::ofstream mesh(path);
+                        mesh << "ordered_triangles_v1 4 2\n"
+                            << (reverse_order ? upper : lower)
+                            << (reverse_order ? lower : upper);
+                    }
+                    whole_body::TriangleTable table(path, rows, {0, scale}, {0, height});
+                    for (const auto &fraction : std::vector<std::array<double, 2>>{
+                            {0.25, 0.75}, {0.75, 0.25}, {0.5 - 1e-6, 0.5},
+                            {0.5 + 1e-6, 0.5}, {0, 0}, {0.5, 0.5}, {1, 1},
+                            {1, 0}, {0, 1}}) {
+                        std::array<double, 2> value;
+                        std::array<double, 4> derivative;
+                        const double x = fraction[0], y = fraction[1];
+                        assert(table.Lookup({x * scale, y * height}, &value, &derivative));
+                        const bool upper_triangle = x < y || (x == y && reverse_order);
+                        for (size_t axis = 0; axis < 2; ++axis) {
+                            assert(std::abs(value[axis] / scale - std::min(x, y)) < 1e-11);
+                            assert(std::abs(derivative[2 * axis] -
+                                (upper_triangle ? 1.0 : 0.0)) < 1e-11);
+                            assert(std::abs(derivative[2 * axis + 1] * aspect -
+                                (upper_triangle ? 0.0 : 1.0)) < 1e-11);
+                        }
+                    }
+                    std::array<double, 2> value;
+                    std::array<double, 4> derivative;
+                    assert(!table.Lookup({-scale, 0}, &value, &derivative));
+                    assert(!table.Lookup({scale, 2 * height}, &value, &derivative));
+                }
+            }
+        }
+    }
 }
 
 class FakeDevices final : public whole_body::DeviceManager {
@@ -282,6 +330,7 @@ int main(int argc, char **argv) {
     // Fixed topology has reproducible derivatives at the diagonal and corners.
     // z0 = 2*x+2*y on lower triangle; 3*x+y on upper triangle.
     const std::string mesh_path = std::string(path) + ".triangles";
+    TestTriangleScales(mesh_path);
     { std::ofstream mesh(mesh_path); mesh << "ordered_triangles_v1 4 2\n0,1,3\n0,3,2\n"; }
     config.table_triangles_file = mesh_path;
     whole_body::CoupledMapping fixed(config);

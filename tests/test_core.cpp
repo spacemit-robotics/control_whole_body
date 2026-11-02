@@ -943,6 +943,56 @@ void TestDampOutsidePositionEnvelope() {
     assert(fake->last_commands[1].mode == MOTOR_MODE_IDLE);
 }
 
+void TestCoupledDampOutsidePositionEnvelope() {
+    for (auto mode : {whole_body::ImpedanceMode::kSoftware,
+            whole_body::ImpedanceMode::kMotor, whole_body::ImpedanceMode::kMotorProjected}) {
+        for (bool invalid_geometry : {false, true}) {
+            auto config = MakeParallelConfig();
+            for (auto &joint : config.joints) {
+                joint.position_limit = {-0.005, 0.005};
+                joint.impedance.mode = mode;
+            }
+            whole_body::CoupledMapping mapping(config.couplings[0]);
+            std::array<double, 2> motor, outside;
+            assert(mapping.JointToMotor({0.02, -0.01}, &motor));
+            assert(mapping.JointToMotor({0.04, -0.01}, &outside));
+            config.couplings[0].ankle_limit = 0.025;
+            auto devices = std::make_unique<DummyDevices>();
+            auto *fake = devices.get();
+            for (size_t i = 0; i < 2; ++i) fake->feedback[i].pos = motor[i];
+            whole_body::WholeBodyCore core(config, std::move(devices));
+            assert(core.Init() == WHOLE_BODY_OK);
+            whole_body_state state{};
+            assert(core.Read(&state) == WHOLE_BODY_OK);
+            auto command = MakeCommand();
+            command.mode = WHOLE_BODY_MODE_DAMP;
+            assert(core.Write(command, Now()) == WHOLE_BODY_OK);
+            for (int sample = 0; sample < 10; ++sample) {
+                assert(core.Read(&state) == WHOLE_BODY_OK);
+                assert(state.position[0] > config.joints[0].position_limit[1]);
+                assert(state.position[1] < config.joints[1].position_limit[0]);
+                assert(core.Write(command, Now()) == WHOLE_BODY_OK);
+                for (const auto &sent : fake->last_commands) {
+                    assert(sent.mode == MOTOR_MODE_HYBRID && sent.kp == 0.0f);
+                    assert(sent.vel_des == 0.0f && sent.trq_des == 0.0f);
+                    assert(mode == whole_body::ImpedanceMode::kSoftware ?
+                        sent.kd == 0.0f : sent.kd > 0.0f);
+                }
+            }
+            if (invalid_geometry) {
+                // DAMP bypasses reference limits, never the mapping's physical domain.
+                for (size_t i = 0; i < 2; ++i) fake->feedback[i].pos = outside[i];
+                assert(core.Read(&state) == WHOLE_BODY_ERR_STATE);
+            } else {
+                command.mode = WHOLE_BODY_MODE_RL;
+                command.position[0] = command.position[1] = 0.0;
+                assert(core.Write(command, Now()) == WHOLE_BODY_ERR_STATE);
+            }
+            for (const auto &sent : fake->last_commands) assert(sent.mode == MOTOR_MODE_IDLE);
+        }
+    }
+}
+
 void TestNativeCoupledImpedance() {
     auto config = MakeParallelConfig();
     // A finite-difference derivative needs solver error well below its perturbation.
@@ -1141,6 +1191,7 @@ int main() {
     TestProjectedCoupledImpedance();
     TestFeedbackPositionPolicy();
     TestDampOutsidePositionEnvelope();
+    TestCoupledDampOutsidePositionEnvelope();
     TestMeasuredVelocityGuard();
     TestStartupFeedbackGate();
     TestStartupTimeoutRecovery();
