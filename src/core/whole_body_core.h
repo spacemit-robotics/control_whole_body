@@ -67,6 +67,7 @@ class WholeBodyCore {
     bool ValidateJointPositions(
         const whole_body_state &state, std::string *reason) const;
     bool ValidateMotorFeedback(std::string *reason) const;
+    bool ValidateMotorPositions(std::string *reason) const;
     int BuildMotorCommands(
         const whole_body_joint_command &command, std::vector<motor_cmd> *motor_commands,
         std::string *reason);

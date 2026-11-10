@@ -363,6 +363,10 @@ int WholeBodyCore::Read(whole_body_state *state) {
         return WaitForInitialState(WHOLE_BODY_ERR_TIMEOUT,
             DescribeWriteFailure("initial disabled handshake has not completed"));
     UpdateMotorPositionBranches();
+    if (has_command_) {
+        std::string reason;
+        if (!ValidateMotorPositions(&reason)) return EnterSafety(WHOLE_BODY_ERR_STATE, reason);
+    }
 
     std::memset(state, 0, sizeof(*state));
     state->num_dof = config_.num_dof;
@@ -574,15 +578,35 @@ bool WholeBodyCore::ValidateJointPositions(
         const auto &joint = config_.joints[i];
         const double position = state.position[i];
         if (!joint.feedback_position_check) continue;
-        if (position >= joint.position_limit[0] - kPositionLimitTolerance &&
-            position <= joint.position_limit[1] + kPositionLimitTolerance) {
+        const auto &limit = joint.feedback_position_limit.value_or(joint.position_limit);
+        if (position >= limit[0] - kPositionLimitTolerance &&
+            position <= limit[1] + kPositionLimitTolerance) {
             continue;
         }
         if (reason) {
             std::ostringstream message;
             message << joint.name << " measured position=" << position
-                    << " is outside physical range [" << joint.position_limit[0] << ", "
-                    << joint.position_limit[1] << "]";
+                    << " is outside feedback range [" << limit[0] << ", "
+                    << limit[1] << "]";
+            *reason = message.str();
+        }
+        return false;
+    }
+    return true;
+}
+
+bool WholeBodyCore::ValidateMotorPositions(std::string *reason) const {
+    for (size_t i = 0; i < config_.motors.size(); ++i) {
+        const auto &motor = config_.motors[i];
+        if (!motor.feedback_position_limit) continue;
+        const auto &limit = *motor.feedback_position_limit;
+        const double position = motor.polarity * (NormalizedMotorPosition(i) - motor.zero_offset);
+        if (position >= limit[0] - kPositionLimitTolerance &&
+            position <= limit[1] + kPositionLimitTolerance) continue;
+        if (reason) {
+            std::ostringstream message;
+            message << motor.name << " measured motor position=" << position
+                    << " is outside feedback range [" << limit[0] << ", " << limit[1] << "]";
             *reason = message.str();
         }
         return false;
@@ -1015,7 +1039,7 @@ int WholeBodyCore::Write(const whole_body_joint_command &command, double monoton
     if (command.enable && command.mode != WHOLE_BODY_MODE_POWER_OFF && has_joint_state_ &&
         ((command.mode != WHOLE_BODY_MODE_DAMP &&
             !ValidateJointPositions(last_state_, &validation_error)) ||
-            !ValidateMotorFeedback(&validation_error))) {
+            !ValidateMotorFeedback(&validation_error) || !ValidateMotorPositions(&validation_error))) {
         return EnterSafety(
             WHOLE_BODY_ERR_STATE, "joint feedback failed validation: " + validation_error);
     }
