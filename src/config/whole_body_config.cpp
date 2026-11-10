@@ -80,6 +80,12 @@ std::array<double, 2> ReadPair(const YAML::Node &node, const std::string &path) 
     return result;
 }
 
+std::array<double, 2> ReadPositionLimit(const YAML::Node &node, const std::string &path) {
+    const auto range = ReadPair(node, path);
+    if (range[0] >= range[1]) throw std::runtime_error(path + " requires lower < upper");
+    return range;
+}
+
 Vec3 ReadVec3(const YAML::Node &node, const std::string &path) {
     if (!node || !node.IsSequence() || node.size() != 3)
         throw std::runtime_error(path + " must contain exactly 3 numbers");
@@ -408,7 +414,10 @@ RuntimeConfig LoadConfig(const std::string &main_config_path) {
         motor.zero_offset = Required<double>(motors[i], "zero_offset", path);
         if (motors[i]["feedback_limits"]) {
             const auto limits = motors[i]["feedback_limits"];
-            CheckKeys(limits, {"velocity_max"}, path + ".feedback_limits");
+            CheckKeys(limits, {"velocity_max", "position"}, path + ".feedback_limits");
+            if (limits["position"])
+                motor.feedback_position_limit = ReadPositionLimit(
+                    limits["position"], path + ".feedback_limits.position");
             motor.feedback_velocity_max =
                 OptionalNonnegative(limits, "velocity_max", path + ".feedback_limits");
         }
@@ -470,13 +479,16 @@ RuntimeConfig LoadConfig(const std::string &main_config_path) {
         const std::string path = "whole_body.joints[" + std::to_string(i) + "]";
         CheckKeys(joints[i],
             {"name", "mapping", "motors", "position_limit", "velocity_limit", "torque_limit",
-                "feedback_position_check", "impedance"},
+                "feedback_position_check", "feedback_position_limit", "impedance"},
             path);
         JointConfig joint;
         joint.name = Required<std::string>(joints[i], "name", path);
         joint.mapping = Required<std::string>(joints[i], "mapping", path);
         joint.motors = Required<std::vector<std::string>>(joints[i], "motors", path);
         joint.position_limit = ReadPair(joints[i]["position_limit"], path + ".position_limit");
+        if (joints[i]["feedback_position_limit"])
+            joint.feedback_position_limit = ReadPositionLimit(
+                joints[i]["feedback_position_limit"], path + ".feedback_position_limit");
         if (joints[i]["feedback_position_check"])
             joint.feedback_position_check = Required<bool>(joints[i], "feedback_position_check", path);
         joint.velocity_limit = Required<double>(joints[i], "velocity_limit", path);

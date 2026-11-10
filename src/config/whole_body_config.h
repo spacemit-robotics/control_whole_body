@@ -48,6 +48,8 @@ struct MotorConfig {
     double polarity = 1.0;
     double zero_offset = 0.0;
     double position_period = 0.0;
+    // Measured motor coordinate after polarity, zero and period normalization.
+    std::optional<std::array<double, 2>> feedback_position_limit;
     // Absolute measured shaft speed; zero leaves this opt-in guard disabled.
     double feedback_velocity_max = 0.0;
     std::vector<uint32_t> non_fatal_error_codes;
@@ -76,6 +78,8 @@ struct JointConfig {
     std::string mapping;
     std::vector<std::string> motors;
     std::array<double, 2> position_limit{};
+    // Omitted: retain position_limit as the feedback range.
+    std::optional<std::array<double, 2>> feedback_position_limit;
     // A reference range is not necessarily a measured-position shutdown threshold.
     // Coupled mechanisms may instead be bounded by their calibrated mapping domain.
     bool feedback_position_check = true;

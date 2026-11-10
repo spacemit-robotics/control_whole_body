@@ -66,13 +66,19 @@ whole_body:
 | `motors[].non_fatal_error_codes` | 按完整错误码匹配的 warning 列表；其他非零错误为致命错误 |
 | `motors[].command_limits` | 电机命令的增益、估算力矩和变化率上限；各项 0 或省略表示不启用 |
 | `motors[].feedback_limits.velocity_max` | 反馈速度绝对值上限，rad/s；0 或省略表示不启用 |
+| `motors[].feedback_limits.position` | 可选 `[lower, upper]`，rad；经过方向、零位、周期归一化后的实际电机反馈范围，省略不检查 |
 | `joints[].position_limit` | 位置参考范围，默认也用于使能期间的反馈角检查 |
+| `joints[].feedback_position_limit` | 可选 `[lower, upper]`，rad；独立的关节反馈范围，省略时使用 `position_limit`，不扩大目标角范围 |
 | `joints[].feedback_position_check` | 默认 true；false 只关闭反馈角与此范围的比较 |
 | `joints[].velocity_limit`、`torque_limit` | 关节速度、力矩限制 |
 | `joints[].impedance` | PD 执行方式及可选阻尼滤波 |
 
 `position_period` 以 `zero_offset` 为首次反馈的分支参考，随后保持跨周期的关节坐标连续；
 反馈换算和位置命令反算使用同一分支。省略时使用原始多圈坐标。
+
+耦合机构的电机反馈界填在 `motors`，虚拟关节反馈界填在 `joints`，两者不要混用。
+反馈范围比较保留 0.001 rad 的数值容差；电机反馈界在使能期间检查，关节反馈界在
+非 DAMP 的使能状态检查。关闭关节反馈角检查不会关闭电机反馈界或映射有效域检查。
 
 关闭反馈角范围检查后，有限值、映射有效域、奇异点、电机故障和通信检查仍然生效。
 硬件参数应来自标定及设备规格，不能用关闭检查代替标定。

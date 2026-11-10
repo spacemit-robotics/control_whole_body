@@ -943,6 +943,57 @@ void TestDampOutsidePositionEnvelope() {
     assert(fake->last_commands[1].mode == MOTOR_MODE_IDLE);
 }
 
+void TestSeparateFeedbackLimits() {
+    for (bool motor_limit : {false, true}) {
+        for (bool crossing_on_read : {false, true}) {
+            auto config = MakeConfig(false);
+            config.joints[0].position_limit = {-0.1, 0.1};
+            if (motor_limit) {
+                config.joints[0].feedback_position_check = false;
+                config.motors[0].feedback_position_limit = {{-0.4, 0.5}};
+                config.motors[0].position_period = 6.283185307;
+            } else {
+                config.joints[0].feedback_position_limit = {{-0.4, 0.5}};
+            }
+            auto devices = std::make_unique<DummyDevices>();
+            auto *fake = devices.get();
+            const auto set_position = [&](double calibrated) {
+                fake->feedback[0].pos = config.motors[0].zero_offset +
+                    config.motors[0].polarity * calibrated + config.motors[0].position_period;
+            };
+            set_position(0.3);  // Beyond the command range, inside the feedback range.
+            whole_body::WholeBodyCore core(config, std::move(devices));
+            assert(core.Init() == WHOLE_BODY_OK);
+            whole_body_state state{};
+            assert(core.Read(&state) == WHOLE_BODY_OK);
+            auto command = MakeCommand();
+            command.position[0] = 0.0;
+            if (crossing_on_read) {
+                assert(core.Write(command, Now()) == WHOLE_BODY_OK);
+                set_position(0.6);
+                assert(core.Read(&state) == WHOLE_BODY_ERR_STATE);
+            } else {
+                set_position(-0.5);
+                assert(core.Read(&state) == WHOLE_BODY_OK);  // Still disabled.
+                assert(core.Write(command, Now()) == WHOLE_BODY_ERR_STATE);
+            }
+            assert(core.LastError().find("feedback range") != std::string::npos);
+            for (const auto &sent : fake->last_commands) assert(sent.mode == MOTOR_MODE_IDLE);
+        }
+    }
+    // A wider measured-position range does not permit wider command targets.
+    auto config = MakeConfig(false);
+    config.joints[0].position_limit = {-0.1, 0.1};
+    config.joints[0].feedback_position_limit = {{-0.4, 0.5}};
+    whole_body::WholeBodyCore core(config, std::make_unique<DummyDevices>());
+    assert(core.Init() == WHOLE_BODY_OK);
+    whole_body_state state{};
+    assert(core.Read(&state) == WHOLE_BODY_OK);
+    auto command = MakeCommand();
+    command.position[0] = 0.3;
+    assert(core.Write(command, Now()) == WHOLE_BODY_ERR_COMMAND);
+}
+
 void TestCoupledDampOutsidePositionEnvelope() {
     for (auto mode : {whole_body::ImpedanceMode::kSoftware,
             whole_body::ImpedanceMode::kMotor, whole_body::ImpedanceMode::kMotorProjected}) {
@@ -1190,6 +1241,7 @@ int main() {
     TestNativeCoupledImpedance();
     TestProjectedCoupledImpedance();
     TestFeedbackPositionPolicy();
+    TestSeparateFeedbackLimits();
     TestDampOutsidePositionEnvelope();
     TestCoupledDampOutsidePositionEnvelope();
     TestMeasuredVelocityGuard();

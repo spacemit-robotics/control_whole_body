@@ -53,6 +53,16 @@ void ValidateImuConfig(const YAML::Node &hardware, bool valid, bool has_imu = tr
     try {
         const auto config = whole_body::LoadConfig(directory + "/main.yaml");
         assert(config.imu.enabled == has_imu);
+        const auto &body = hardware["whole_body"];
+        if (body["joints"][0]["feedback_position_limit"]) {
+            assert(config.joints[0].feedback_position_limit);
+            assert((*config.joints[0].feedback_position_limit)[0] == -2.4);
+        }
+        if (body["motors"][0]["feedback_limits"] &&
+            body["motors"][0]["feedback_limits"]["position"]) {
+            assert(config.motors[0].feedback_position_limit);
+            assert((*config.motors[0].feedback_position_limit)[1] == 2.6);
+        }
         if (!has_imu) {
             assert(config.imu.driver.empty());
             assert(config.imu.device.empty());
@@ -90,6 +100,21 @@ void TestOptionalImuConfig() {
     ValidateImuConfig(hardware, false);
     hardware["whole_body"]["imu"].remove("unknown");
     hardware["whole_body"]["motors"][0]["bus"] = "missing_bus";
+    ValidateImuConfig(hardware, false);
+}
+
+void TestFeedbackLimitsConfig() {
+    auto hardware = YAML::LoadFile(std::string(TEST_DATA_DIR) + "/hardware.yaml");
+    auto body = hardware["whole_body"];
+    body["joints"][0]["feedback_position_limit"] = YAML::Load("[-2.4, 2.5]");
+    body["motors"][0]["feedback_limits"]["position"] = YAML::Load("[-2.3, 2.6]");
+    ValidateImuConfig(hardware, true);
+    for (const char *invalid : {"[1, -1]", "[0, 0]", "[.nan, 1]", "[0]"}) {
+        body["motors"][0]["feedback_limits"]["position"] = YAML::Load(invalid);
+        ValidateImuConfig(hardware, false);
+    }
+    body["motors"][0]["feedback_limits"]["position"] = YAML::Load("[-2.3, 2.6]");
+    body["joints"][0]["feedback_position_limit"] = YAML::Load("[.inf, 1]");
     ValidateImuConfig(hardware, false);
 }
 
@@ -140,6 +165,7 @@ int main(int argc, char *argv[]) {
     assert(whole_body_has_imu(nullptr) == WHOLE_BODY_ERR_STATE);
     ValidatePublicCreate(data_dir + "/main.yaml", true);
     TestOptionalImuConfig();
+    TestFeedbackLimitsConfig();
 
     bool rejected_unknown_field = false;
     try {
