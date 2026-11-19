@@ -72,6 +72,10 @@ set_target_properties(whole_body PROPERTIES
 
 if(CMAKE_CXX_COMPILER_ID MATCHES "GNU|Clang")
     target_compile_options(whole_body PRIVATE -Wall -Wextra -Werror)
+    # Delaunay predicates depend on separately rounded intermediate results.
+    # FMA contraction can leave valid calibration grid cells untriangulated on RV64.
+    set_property(SOURCE src/mapping/table_mapping.cpp APPEND PROPERTY
+        COMPILE_OPTIONS -ffp-contract=off)
 endif()
 
 install(TARGETS whole_body
